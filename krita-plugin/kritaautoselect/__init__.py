@@ -17,9 +17,9 @@ from krita import (
 from PyQt5.QtCore import QEvent, QObject, QPointF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPalette
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QOpenGLWidget, QPlainTextEdit, QPushButton, QSpinBox,
-    QToolButton, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QOpenGLWidget,
+    QPlainTextEdit, QPushButton, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 from PyQt5.QtCore import QBuffer, QByteArray, QIODevice
 import base64
@@ -210,6 +210,10 @@ class AutoSelectDocker(DockWidget):
         self._feather.setValue(0)
         opts.addWidget(self._feather)
         layout.addLayout(opts)
+
+        self._goto_check = QCheckBox("Ir a la selección (zoom + resaltado)")
+        self._goto_check.setChecked(True)
+        layout.addWidget(self._goto_check)
 
         # Fila: botón Seleccionar + toggle de modo click (lazo)
         actions = QHBoxLayout()
@@ -406,6 +410,9 @@ class AutoSelectDocker(DockWidget):
         plural = "instancia" if data["count"] == 1 else "instancias"
         self._set_status(
             f"Seleccioné {data['count']} {plural} (score {best})", "green")
+        if self._goto_check.isChecked():
+            self._zoom_to_selection()
+            self._pulse_selection_mask()
 
     def _apply_mask(self, mask_b64):
         """Máscara PNG → Selection, con el modo del combo y feather opcional.
@@ -444,6 +451,80 @@ class AutoSelectDocker(DockWidget):
         if feather > 0:
             target.feather(feather)
         doc.setSelection(target)
+
+    # ----- feedback visual: "mostrame lo que seleccionaste" -----
+
+    def _pulse_selection_mask(self):
+        """Flash de la máscara de selección global (~1.5s): resalta en rosa
+        todo lo NO seleccionado y se apaga sola. Si el usuario ya la tenía
+        activa, no se toca."""
+        try:
+            action = Krita.instance().action("show-global-selection-mask")
+            if action is None or action.isChecked():
+                return
+
+            action.trigger()
+
+            def off():
+                try:
+                    if action.isChecked():
+                        action.trigger()
+                except Exception:
+                    pass
+
+            QTimer.singleShot(1500, off)
+        except Exception:
+            pass
+
+    def _zoom_to_selection(self):
+        """Encajar la selección en ~40% del viewport y centrarla. El factor
+        de zoom se calcula contra la escala real actual (transformada del
+        canvas), así no depende del DPI del documento."""
+        try:
+            doc = Krita.instance().activeDocument()
+            sel = doc.selection() if doc else None
+            window = Krita.instance().activeWindow()
+            view = window.activeView() if window else None
+            if sel is None or view is None or \
+                    not hasattr(view, "flakeToImageTransform"):
+                return
+            gl_widgets = window.qwindow().findChildren(QOpenGLWidget)
+            if not gl_widgets:
+                return
+            gl = gl_widgets[0]
+
+            inverse, ok = view.flakeToImageTransform().inverted()
+            if not ok:
+                return
+            current_scale = abs(inverse.m11()) or 1e-6
+            margin = 2.5
+            desired_scale = min(
+                gl.width() / max(1.0, sel.width() * margin),
+                gl.height() / max(1.0, sel.height() * margin))
+            desired_scale = max(0.05, min(6.0, desired_scale))
+            canvas = view.canvas()
+            canvas.setZoomLevel(
+                canvas.zoomLevel() * desired_scale / current_scale)
+            QApplication.processEvents()
+
+            inverse, ok = view.flakeToImageTransform().inverted()
+            if not ok:
+                return
+            center_doc = QPointF(sel.x() + sel.width() / 2.0,
+                                 sel.y() + sel.height() / 2.0)
+            target = inverse.map(center_doc)
+            scroller = gl.parentWidget()
+            while scroller is not None and \
+                    not isinstance(scroller, QAbstractScrollArea):
+                scroller = scroller.parentWidget()
+            if scroller is not None:
+                center = gl.rect().center()
+                hbar = scroller.horizontalScrollBar()
+                vbar = scroller.verticalScrollBar()
+                hbar.setValue(hbar.value() + int(target.x() - center.x()))
+                vbar.setValue(vbar.value() + int(target.y() - center.y()))
+        except Exception:
+            pass
 
     # ----- modo click -----
 
