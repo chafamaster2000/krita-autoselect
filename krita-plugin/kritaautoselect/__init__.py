@@ -91,13 +91,25 @@ class DaemonClient(QObject):
 class CanvasClickFilter(QObject):
     """Modo click: captura el click sobre el canvas y lo convierte a
     coordenadas de imagen (zoom/pan/rotación resueltos por Krita 5.2+
-    con flakeToImageTransform)."""
+    con flakeToImageTransform).
+
+    Traga el press Y el release del botón izquierdo mientras está armado:
+    entregar solo la mitad del par a la herramienta activa de Krita deja su
+    máquina de estados de input colgada."""
 
     clicked = pyqtSignal(int, int, bool)  # x, y, es_negativo
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.MouseButtonPress and \
-                event.button() == Qt.LeftButton:
+        try:
+            etype = event.type()
+            if etype not in (QEvent.MouseButtonPress,
+                             QEvent.MouseButtonRelease,
+                             QEvent.MouseButtonDblClick):
+                return False
+            if event.button() != Qt.LeftButton:
+                return False
+            if etype != QEvent.MouseButtonPress:
+                return True  # release/dblclick del par: solo tragarlo
             window = Krita.instance().activeWindow()
             view = window.activeView() if window else None
             doc = Krita.instance().activeDocument()
@@ -111,8 +123,9 @@ class CanvasClickFilter(QObject):
             if 0 <= x < doc.width() and 0 <= y < doc.height():
                 negative = bool(event.modifiers() & Qt.ControlModifier)
                 self.clicked.emit(x, y, negative)
-                return True  # que no le llegue a la herramienta activa
-        return False
+            return True
+        except Exception:
+            return False  # jamás dejar que una excepción suba al event loop
 
 
 class AutoSelectDocker(DockWidget):
@@ -120,11 +133,13 @@ class AutoSelectDocker(DockWidget):
         super().__init__()
         self.setWindowTitle("AI Select")
         self._colors = _palette_colors()
-        self._client = DaemonClient()
-        self._client.finished.connect(self._on_segment_result)
-        self._client.health.connect(self._on_health)
-        self._click_filter = CanvasClickFilter()
-        self._click_filter.clicked.connect(self._on_canvas_click)
+        self._client = DaemonClient(self)
+        self._client.finished.connect(self._on_segment_result,
+                                      Qt.QueuedConnection)
+        self._client.health.connect(self._on_health, Qt.QueuedConnection)
+        self._click_filter = CanvasClickFilter(self)
+        self._click_filter.clicked.connect(self._on_canvas_click,
+                                           Qt.QueuedConnection)
         self._filtered_widgets = []
         self._server_process = None
         self._busy = False
@@ -233,17 +248,23 @@ class AutoSelectDocker(DockWidget):
 
     def canvasChanged(self, canvas):
         # Si cambia la vista con el modo click armado, re-enganchar el filtro.
-        if self._click_btn.isChecked():
-            self._detach_click_filter()
-            self._attach_click_filter()
+        try:
+            if self._click_btn.isChecked():
+                self._detach_click_filter()
+                self._attach_click_filter()
+        except Exception:
+            pass
 
     def eventFilter(self, obj, event):
-        if obj is self._prompt and event.type() == QEvent.KeyPress:
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and \
-                    event.modifiers() & Qt.ShiftModifier:
-                self._segment_from_prompt()
-                return True
-        return super().eventFilter(obj, event)
+        try:
+            if obj is self._prompt and event.type() == QEvent.KeyPress:
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter) and \
+                        event.modifiers() & Qt.ShiftModifier:
+                    self._segment_from_prompt()
+                    return True
+        except Exception:
+            pass
+        return False
 
     # ----- settings -----
 
