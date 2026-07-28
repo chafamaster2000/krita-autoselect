@@ -19,8 +19,10 @@ curl -X POST :5679/segment -d ...     any image → mask
   timeout (default 5 min, configurable, `0` = stay resident). Before loading,
   if VRAM is scarce it asks ComfyUI (`/free`) to drop its cached models —
   this daemon is designed to *coexist* with image generation on one GPU.
-- **One model**: SAM 3 does both concept prompts (text) and visual prompts.
-  Click points are converted to tiny positive/negative exemplar boxes.
+- **One checkpoint, two heads**: a text prompt routes to SAM 3's *concept*
+  head (PCS — every instance matching "the red car"); a clicks/box-only
+  prompt routes to the *tracker* head (PVS, SAM2-style — the exact object
+  under your click). With text, points/box act as concept refiners instead.
 - **stdlib HTTP** on `127.0.0.1` only, browser-origin requests rejected,
   optional shared token. The heavy deps (torch, transformers) are only
   imported when a segmentation actually runs.
@@ -101,8 +103,12 @@ directory containing the model files.
 }
 ```
 
-- At least one prompt (`text`, `points`, `box`) is required; they compose.
-- `points` are clicks; `point_labels` 1 = include (default), 0 = exclude.
+- At least one prompt (`text`, `points`, `box`) is required.
+- With `text`: concept mode — all matching instances; `points`/`box` refine
+  the concept (1 = include, 0 = exclude).
+- Without `text`: object mode — `points` are clicks on ONE object
+  (`point_labels` 0 = "not this part"), `box` surrounds the object; returns
+  that exact object's mask.
 - `box` is `[x, y, width, height]` in pixels.
 - `combine`: `"union"` merges every instance above `threshold` into one mask;
   an integer selects a single instance (0 = best score).

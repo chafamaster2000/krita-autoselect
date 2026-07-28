@@ -1,6 +1,8 @@
-# Install torch separately with the CUDA index that matches your setup, e.g.:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+# Install torch/torchvision separately with the CUDA index that matches your
+# setup, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 torch
+torchvision
 transformers>=4.57
 huggingface_hub
 pillow

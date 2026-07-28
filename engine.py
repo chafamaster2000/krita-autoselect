@@ -49,6 +49,8 @@ class Sam3Engine:
         self._lock = threading.Lock()  # serializes load/unload/inference
         self._model = None
         self._processor = None
+        self._tracker = None            # PVS head (click-to-object, SAM2-style)
+        self._tracker_processor = None
         self._resolved_device = None
         self._last_used = 0.0
         self._watchdog_started = False
@@ -59,6 +61,7 @@ class Sam3Engine:
         return {
             "model": self.model_id,
             "loaded": self._model is not None,
+            "tracker_loaded": self._tracker is not None,
             "device": self._resolved_device,
             "unload_after_s": self.unload_after_s,
         }
@@ -123,15 +126,53 @@ class Sam3Engine:
             self._watchdog_started = True
             threading.Thread(target=self._watchdog_loop, daemon=True).start()
 
+    def _load_tracker_locked(self):
+        """Load the PVS head (Sam3Tracker): click/box → the exact object.
+
+        Same checkpoint as the detector; loaded independently and only when a
+        visual-only prompt arrives, so text users never pay for it."""
+        import torch
+        from transformers import Sam3TrackerModel, Sam3TrackerProcessor
+
+        device = self._resolved_device or self.device or (
+            "cuda" if torch.cuda.is_available() else "cpu")
+        if self.dtype_name:
+            dtype = getattr(torch, self.dtype_name)
+        else:
+            dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+
+        self._ensure_vram(torch, device)
+        source = self.weights_path or self.model_id
+        t0 = time.time()
+        try:
+            processor = Sam3TrackerProcessor.from_pretrained(source)
+            model = Sam3TrackerModel.from_pretrained(source, dtype=dtype)
+        except Exception as e:
+            error = f"Could not load SAM 3 tracker from '{source}': {e}"
+            if not self.weights_path:
+                error += f" | Hint: {GATED_WEIGHTS_HELP}"
+            raise EngineError(error) from e
+        model = model.to(device).eval()
+        self._tracker, self._tracker_processor = model, processor
+        self._resolved_device = device
+        self._dtype = dtype
+        print(f"[autoselect] SAM 3 tracker loaded on {device} ({dtype}) "
+              f"in {time.time() - t0:.1f}s")
+        if not self._watchdog_started:
+            self._watchdog_started = True
+            threading.Thread(target=self._watchdog_loop, daemon=True).start()
+
     def unload(self):
         with self._lock:
             self._unload_locked()
 
     def _unload_locked(self):
-        if self._model is None:
+        if self._model is None and self._tracker is None:
             return
         self._model = None
         self._processor = None
+        self._tracker = None
+        self._tracker_processor = None
         try:
             import torch
             if self._resolved_device and self._resolved_device.startswith("cuda"):
@@ -147,7 +188,8 @@ class Sam3Engine:
                 continue
             with self._lock:
                 idle = time.time() - self._last_used
-                if self._model is not None and idle > self.unload_after_s:
+                loaded = self._model is not None or self._tracker is not None
+                if loaded and idle > self.unload_after_s:
                     self._unload_locked()
 
     # ----- inference -----
@@ -177,12 +219,14 @@ class Sam3Engine:
                 combine="union", list_only=False):
         """Run SAM 3 and compose the final mask.
 
+        Routing: a text prompt → concept mode (PCS, every matching instance;
+        points/box refine the concept). Visual-only prompt → tracker mode
+        (PVS, SAM2-style: the exact object under the clicks / in the box).
+
         Returns {"instances": [{index, score, box}], "width", "height",
         "count", "mask_b64"? } — mask_b64 is a canvas-sized grayscale PNG,
         omitted when list_only or when nothing matched.
         """
-        import numpy as np
-        import torch
         from PIL import Image
 
         try:
@@ -190,8 +234,24 @@ class Sam3Engine:
             image = image.convert("RGB")
         except Exception as e:
             raise EngineError(f"Invalid image payload: {e}") from e
-        width, height = image.size
 
+        if text:
+            instances, np_masks = self._segment_concept(
+                image, text, points, point_labels, box,
+                threshold, mask_threshold)
+        else:
+            instances, np_masks = self._segment_visual(
+                image, points, point_labels, box)
+        return self._compose(image.size, instances, np_masks,
+                             combine, list_only)
+
+    def _segment_concept(self, image, text, points, point_labels, box,
+                         threshold, mask_threshold):
+        """PCS: all instances of a concept (text + optional exemplar refiners)."""
+        import numpy as np
+        import torch
+
+        width, height = image.size
         with self._lock:
             if self._model is None:
                 self._load_locked()
@@ -200,9 +260,7 @@ class Sam3Engine:
 
             boxes, labels = self._prompt_boxes(
                 width, height, points, point_labels, box)
-            kwargs = {}
-            if text:
-                kwargs["text"] = text
+            kwargs = {"text": text}
             if boxes:
                 kwargs["input_boxes"] = [boxes]
                 kwargs["input_boxes_labels"] = [labels]
@@ -222,23 +280,73 @@ class Sam3Engine:
             )[0]
             self._last_used = time.time()
 
-        masks = results["masks"]
         scores = results["scores"]
-        bxs = results["boxes"]
         order = sorted(range(len(scores)),
                        key=lambda i: float(scores[i]), reverse=True)
-        instances = []
-        np_masks = []
+        instances, np_masks = [], []
         for rank, i in enumerate(order):
             instances.append({
                 "index": rank,
                 "score": round(float(scores[i]), 4),
-                "box": [round(float(v), 1) for v in bxs[i]],
+                "box": [round(float(v), 1) for v in results["boxes"][i]],
             })
-            np_masks.append(np.asarray(masks[i].cpu()).astype(bool))
-        print(f"[autoselect] segment: {len(instances)} instance(s) "
+            np_masks.append(np.asarray(results["masks"][i].cpu()).astype(bool))
+        print(f"[autoselect] concept: {len(instances)} instance(s) "
               f"in {time.time() - t0:.2f}s")
+        return instances, np_masks
 
+    def _segment_visual(self, image, points, point_labels, box):
+        """PVS (tracker): the one object under the clicks / in the box."""
+        import numpy as np
+        import torch
+
+        with self._lock:
+            if self._tracker is None:
+                self._load_tracker_locked()
+            self._last_used = time.time()
+            model, processor = self._tracker, self._tracker_processor
+
+            kwargs = {}
+            if points:
+                kwargs["input_points"] = [[[list(p) for p in points]]]
+                kwargs["input_labels"] = [[[
+                    1 if int(l) else 0
+                    for l in (point_labels or [1] * len(points))]]]
+            if box:
+                x, y, w, h = [float(v) for v in box]
+                kwargs["input_boxes"] = [[[x, y, x + w, y + h]]]
+            inputs = processor(images=image, return_tensors="pt", **kwargs)
+            inputs = inputs.to(model.device)
+            if torch.is_tensor(inputs.get("pixel_values")):
+                inputs["pixel_values"] = inputs["pixel_values"].to(self._dtype)
+
+            t0 = time.time()
+            with torch.no_grad():
+                outputs = model(**inputs)
+            masks = processor.post_process_masks(
+                outputs.pred_masks.float().cpu(), inputs["original_sizes"])[0]
+            self._last_used = time.time()
+
+        # (num_objects=1, num_masks, H, W) ranked by predicted IoU — keep best.
+        ious = outputs.iou_scores.float().cpu().numpy().reshape(-1)
+        best = int(ious.argmax())
+        mask = np.asarray(masks[0][best]).astype(bool)
+        ys, xs = np.where(mask)
+        if not len(xs):
+            print("[autoselect] visual: empty mask")
+            return [], []
+        bbox = [float(xs.min()), float(ys.min()),
+                float(xs.max() + 1), float(ys.max() + 1)]
+        print(f"[autoselect] visual: 1 object (iou {ious[best]:.2f}) "
+              f"in {time.time() - t0:.2f}s")
+        return [{"index": 0, "score": round(float(ious[best]), 4),
+                 "box": bbox}], [mask]
+
+    def _compose(self, size, instances, np_masks, combine, list_only):
+        import numpy as np
+        from PIL import Image
+
+        width, height = size
         out = {"width": width, "height": height,
                "count": len(instances), "instances": instances}
         if list_only or not instances:
