@@ -11,7 +11,8 @@ La red corre en un thread (nunca en el hilo de UI de Krita); el resultado
 vuelve por señal Qt y la selección se aplica en el main thread.
 """
 from krita import (
-    DockWidget, DockWidgetFactory, DockWidgetFactoryBase, Krita, Selection,
+    DockWidget, DockWidgetFactory, DockWidgetFactoryBase, Extension, Krita,
+    Selection,
 )
 from PyQt5.QtCore import QEvent, QObject, QPointF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPalette
@@ -32,6 +33,13 @@ SETTINGS_GROUP = "kritaautoselect"
 DEFAULT_URL = "http://127.0.0.1:5679"
 MODES = [("Reemplazar", "replace"), ("Agregar", "add"),
          ("Restar", "subtract"), ("Intersecar", "intersect")]
+# Herramienta inofensiva mientras el modo click está armado: aunque algún
+# evento se escape del filtro, una selección de contorno sin arrastre no
+# pinta ni destruye nada.
+SAFE_TOOL = "KisToolSelectOutline"
+
+# Dockers vivos (para la acción de atajo de teclado).
+_dockers = []
 
 
 def _palette_colors():
@@ -99,12 +107,21 @@ class CanvasClickFilter(QObject):
 
     clicked = pyqtSignal(int, int, bool)  # x, y, es_negativo
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Instalado sobre QApplication (corre ANTES que el KisInputManager de
+        # Krita, que también filtra a nivel app); solo actúa sobre eventos
+        # cuyo receptor es el canvas.
+        self.canvas_widgets = []
+
     def eventFilter(self, obj, event):
         try:
             etype = event.type()
             if etype not in (QEvent.MouseButtonPress,
                              QEvent.MouseButtonRelease,
                              QEvent.MouseButtonDblClick):
+                return False
+            if obj not in self.canvas_widgets:
                 return False
             if event.button() != Qt.LeftButton:
                 return False
@@ -143,8 +160,10 @@ class AutoSelectDocker(DockWidget):
         self._filtered_widgets = []
         self._server_process = None
         self._busy = False
+        self._previous_tool = None
         self._build_ui()
         self._load_settings()
+        _dockers.append(self)
         QTimer.singleShot(1500, self._client.check_health)
 
     # ----- UI -----
@@ -453,20 +472,72 @@ class AutoSelectDocker(DockWidget):
             targets = [w for w in qwin.findChildren(QWidget)
                        if w.metaObject().className()
                        in ("KisOpenGLCanvas2", "KisQPainterCanvas")]
-        for widget in targets:
-            widget.installEventFilter(self._click_filter)
-            self._filtered_widgets.append(widget)
-        return len(self._filtered_widgets)
+        if not targets:
+            return 0
+        self._click_filter.canvas_widgets = targets
+        # A nivel aplicación: el KisInputManager de Krita también filtra ahí,
+        # y el último filtro instalado corre primero — así el click nos llega
+        # antes de que la herramienta activa lo procese.
+        QApplication.instance().installEventFilter(self._click_filter)
+        self._filtered_widgets = targets
+        self._switch_to_safe_tool()
+        return len(targets)
 
     def _detach_click_filter(self):
-        for widget in self._filtered_widgets:
-            try:
-                widget.removeEventFilter(self._click_filter)
-            except RuntimeError:
-                pass  # widget destruido
+        try:
+            QApplication.instance().removeEventFilter(self._click_filter)
+        except RuntimeError:
+            pass
+        self._click_filter.canvas_widgets = []
         self._filtered_widgets = []
+        self._restore_tool()
+
+    def _switch_to_safe_tool(self):
+        """Como una tool de verdad: mientras el modo click está armado, la
+        herramienta activa pasa a ser la selección de contorno (el pincel no
+        puede pintar). Krita no expone cuál era la herramienta anterior, así
+        que al salir se vuelve siempre al pincel."""
+        try:
+            safe = Krita.instance().action(SAFE_TOOL)
+            if safe:
+                safe.trigger()
+        except Exception:
+            pass
+
+    def _restore_tool(self):
+        try:
+            brush = Krita.instance().action("KritaShape/KisToolBrush")
+            if brush:
+                brush.trigger()
+        except Exception:
+            pass
 
 
+class AutoSelectExtension(Extension):
+    """Registra la acción de atajo: alternar el modo click sin ir al panel
+    (Herramientas → Scripts → "AI Select: modo click"; atajo asignable en
+    Configurar Krita → Atajos de teclado)."""
+
+    def setup(self):
+        pass
+
+    def createActions(self, window):
+        action = window.createAction(
+            "kritaautoselect_toggle_click", "AI Select: modo click",
+            "tools/scripts")
+        action.triggered.connect(_toggle_click_mode_action)
+
+
+def _toggle_click_mode_action():
+    for docker in _dockers:
+        try:
+            docker._click_btn.toggle()
+            return
+        except RuntimeError:
+            continue  # docker destruido
+
+
+Krita.instance().addExtension(AutoSelectExtension(Krita.instance()))
 Krita.instance().addDockWidgetFactory(
     DockWidgetFactory("aiSelect", DockWidgetFactoryBase.DockRight,
                       AutoSelectDocker)
