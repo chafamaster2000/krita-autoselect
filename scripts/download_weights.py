@@ -22,6 +22,8 @@ from huggingface_hub.utils import build_hf_headers
 REPO = os.environ.get("AUTOSELECT_MODEL", "facebook/sam3")
 CHUNK = 1024 * 1024
 MAX_ATTEMPTS = 60
+# Original-format checkpoint, redundant with model.safetensors (~3.4 GB saved).
+SKIP_FILES = {"sam3.pt"}
 
 
 def _resolve_cdn_url(client, url, headers):
@@ -75,6 +77,9 @@ def main():
     print(f"{REPO}: {len(files)} files -> {target}", flush=True)
     with httpx.Client(timeout=60) as client:
         for name in files:
+            if name in SKIP_FILES:
+                print(f"- {name} (skipped)", flush=True)
+                continue
             dest = os.path.join(target, name.replace("/", os.sep))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             if os.path.exists(dest):
