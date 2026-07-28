@@ -307,6 +307,7 @@ class Sam3Engine:
             model, processor = self._tracker, self._tracker_processor
 
             kwargs = {}
+            n_points = len(points) if points else 0
             if points:
                 kwargs["input_points"] = [[[list(p) for p in points]]]
                 kwargs["input_labels"] = [[[
@@ -322,7 +323,13 @@ class Sam3Engine:
 
             t0 = time.time()
             with torch.no_grad():
-                outputs = model(**inputs)
+                # Con un solo punto conviene el multimask (3 candidatas, gana
+                # la de mejor IoU); con refinamiento multi-punto la API
+                # recomienda una sola máscara.
+                if n_points > 1:
+                    outputs = model(**inputs, multimask_output=False)
+                else:
+                    outputs = model(**inputs)
             masks = processor.post_process_masks(
                 outputs.pred_masks.float().cpu(), inputs["original_sizes"])[0]
             self._last_used = time.time()

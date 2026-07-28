@@ -105,7 +105,9 @@ class CanvasClickFilter(QObject):
     entregar solo la mitad del par a la herramienta activa de Krita deja su
     máquina de estados de input colgada."""
 
-    clicked = pyqtSignal(int, int, bool)  # x, y, es_negativo
+    # x, y, kind: "new" = objeto nuevo, "pos" = refinar (Shift),
+    # "neg" = excluir parte (Ctrl)
+    clicked = pyqtSignal(int, int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,8 +140,13 @@ class CanvasClickFilter(QObject):
             point = transform.map(QPointF(event.pos()))
             x, y = int(point.x()), int(point.y())
             if 0 <= x < doc.width() and 0 <= y < doc.height():
-                negative = bool(event.modifiers() & Qt.ControlModifier)
-                self.clicked.emit(x, y, negative)
+                if event.modifiers() & Qt.ControlModifier:
+                    kind = "neg"
+                elif event.modifiers() & Qt.ShiftModifier:
+                    kind = "pos"
+                else:
+                    kind = "new"
+                self.clicked.emit(x, y, kind)
             return True
         except Exception:
             return False  # jamás dejar que una excepción suba al event loop
@@ -161,6 +168,9 @@ class AutoSelectDocker(DockWidget):
         self._server_process = None
         self._busy = False
         self._previous_tool = None
+        # Puntos acumulados del modo click (refinamiento estilo SAM).
+        self._click_points = []
+        self._click_labels = []
         self._build_ui()
         self._load_settings()
         _dockers.append(self)
@@ -226,8 +236,9 @@ class AutoSelectDocker(DockWidget):
             Krita.instance().icon("tool_outline_selection"))
         self._click_btn.setCheckable(True)
         self._click_btn.setToolTip(
-            "Modo click: tocá un objeto en el canvas para seleccionarlo\n"
-            "(Ctrl+click = excluir esa parte)")
+            "Modo click: tocá un objeto en el canvas para seleccionarlo.\n"
+            "Shift+click: sumar un punto de refinamiento al mismo objeto.\n"
+            "Ctrl+click: excluir esa parte del objeto.")
         self._click_btn.setFixedSize(34, 32)
         self._click_btn.toggled.connect(self._toggle_click_mode)
         actions.addWidget(self._click_btn)
@@ -371,11 +382,27 @@ class AutoSelectDocker(DockWidget):
         if not text:
             self._set_status("Escribí qué seleccionar", "yellow")
             return
+        self._click_points = []  # el prompt arranca una selección nueva
+        self._click_labels = []
         self._segment({"text": text})
 
-    def _on_canvas_click(self, x, y, negative):
-        self._segment({"points": [[x, y]],
-                       "point_labels": [0 if negative else 1]})
+    def _on_canvas_click(self, x, y, kind):
+        """Click = objeto nuevo; Shift+click suma un punto de refinamiento;
+        Ctrl+click excluye una parte. Los refinamientos re-segmentan el MISMO
+        objeto con todos los puntos acumulados."""
+        if kind == "new" or not self._click_points:
+            if kind == "neg":
+                self._set_status(
+                    "Primero un click normal sobre el objeto; Ctrl+click "
+                    "después, para excluir partes", "yellow")
+                return
+            self._click_points = [[x, y]]
+            self._click_labels = [1]
+        else:
+            self._click_points.append([x, y])
+            self._click_labels.append(0 if kind == "neg" else 1)
+        self._segment({"points": list(self._click_points),
+                       "point_labels": list(self._click_labels)})
 
     def _segment(self, prompt_payload):
         if self._busy:
@@ -408,8 +435,13 @@ class AutoSelectDocker(DockWidget):
             return
         best = data["instances"][0].get("score", 0)
         plural = "instancia" if data["count"] == 1 else "instancias"
-        self._set_status(
-            f"Seleccioné {data['count']} {plural} (score {best})", "green")
+        if best < 0.5 and self._click_points:
+            self._set_status(
+                f"Score bajo ({best}) — click ambiguo. Shift+click suma "
+                "otro punto del objeto; Ctrl+click excluye partes.", "yellow")
+        else:
+            self._set_status(
+                f"Seleccioné {data['count']} {plural} (score {best})", "green")
         if self._goto_check.isChecked():
             self._zoom_to_selection()
 
@@ -475,7 +507,8 @@ class AutoSelectDocker(DockWidget):
             if action is None:
                 raise RuntimeError(f"acción no encontrada: {action_name}")
             action.trigger()
-            QApplication.processEvents()
+            # NO processEvents acá: puede re-entrar otros handlers con la
+            # capa temporal viva (mutación concurrente → crash en libkis).
             doc.waitForDone()
         finally:
             if prev is not None:
@@ -546,10 +579,13 @@ class AutoSelectDocker(DockWidget):
                 self._click_btn.setChecked(False)
                 return
             self._set_status(
-                "Modo click: tocá el objeto (Ctrl+click excluye). "
-                "Volvé a apretar el botón para salir.", "green")
+                "Modo click: tocá el objeto. Shift+click refina, "
+                "Ctrl+click excluye. Volvé a apretar el botón para salir.",
+                "green")
         else:
             self._detach_click_filter()
+            self._click_points = []
+            self._click_labels = []
             self._set_status("Modo click desactivado", "grey")
 
     def _attach_click_filter(self):
