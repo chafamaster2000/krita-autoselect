@@ -26,8 +26,10 @@ GATED_WEIGHTS_HELP = (
     "Could not download SAM 3 weights. The checkpoint is gated on Hugging "
     "Face: (1) accept the license at https://huggingface.co/facebook/sam3 "
     "with your HF account, (2) authenticate on this machine (set HF_TOKEN "
-    "or run `hf auth login`). Alternatively set AUTOSELECT_WEIGHTS_PATH to "
-    "a local directory with the downloaded model."
+    "or run `hf auth login`), and (3) if you use a fine-grained token, "
+    "enable 'Access public gated repositories' in its settings at "
+    "https://huggingface.co/settings/tokens. Alternatively set "
+    "AUTOSELECT_WEIGHTS_PATH to a local directory with the downloaded model."
 )
 
 
@@ -105,7 +107,12 @@ class Sam3Engine:
             if any(k in msg.lower() for k in ("gated", "401", "403", "token",
                                               "authorized", "authentication")):
                 raise EngineError(GATED_WEIGHTS_HELP) from e
-            raise EngineError(f"Could not load SAM 3 from '{source}': {e}") from e
+            error = f"Could not load SAM 3 from '{source}': {e}"
+            if not self.weights_path:
+                # transformers often swallows the underlying 401/403 into a
+                # generic message — for hub loads, always include the fix.
+                error += f" | Hint: {GATED_WEIGHTS_HELP}"
+            raise EngineError(error) from e
         model = model.to(device).eval()
         self._model, self._processor = model, processor
         self._resolved_device = device

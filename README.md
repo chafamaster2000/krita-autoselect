@@ -39,8 +39,19 @@ python -m venv .venv
 
 1. Accept the license at <https://huggingface.co/facebook/sam3>.
 2. Authenticate on this machine: `hf auth login` (or set `HF_TOKEN`).
+3. Fine-grained token? Enable **"Access public gated repositories"** in its
+   settings at <https://huggingface.co/settings/tokens> — without it,
+   downloads fail with 403 even after accepting the license.
 
-First segmentation downloads the weights (~3.4 GB) to the HF cache.
+First segmentation downloads the weights (~3.4 GB) to the HF cache. If your
+network mangles ETags (some AV/proxies do — symptoms: `WinError 123` with a
+`****` filename), use the bundled resilient downloader instead:
+
+```bash
+.venv/Scripts/python scripts/download_weights.py   # -> models/sam3
+AUTOSELECT_WEIGHTS_PATH=models/sam3 .venv/Scripts/python server.py
+```
+
 Fully offline alternative: set `AUTOSELECT_WEIGHTS_PATH` to a local
 directory containing the model files.
 

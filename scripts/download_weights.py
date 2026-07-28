@@ -24,15 +24,28 @@ CHUNK = 1024 * 1024
 MAX_ATTEMPTS = 60
 
 
+def _resolve_cdn_url(client, url, headers):
+    """Follow the huggingface.co redirect by hand: auth goes to the hub only,
+    never to the CDN (a presigned CDN URL rejects foreign Authorization)."""
+    r = client.get(url, headers=headers, follow_redirects=False)
+    if r.status_code in (301, 302, 303, 307, 308):
+        return r.headers["Location"]
+    r.raise_for_status()
+    return url  # served directly (small files)
+
+
 def download_file(client, url, headers, dest):
     tmp = dest + ".part"
     for attempt in range(1, MAX_ATTEMPTS + 1):
         offset = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-        req_headers = dict(headers)
-        if offset:
-            req_headers["Range"] = f"bytes={offset}-"
         try:
-            with client.stream("GET", url, headers=req_headers,
+            final_url = _resolve_cdn_url(client, url, headers)
+            req_headers = {}
+            if final_url == url:
+                req_headers.update(headers)
+            if offset:
+                req_headers["Range"] = f"bytes={offset}-"
+            with client.stream("GET", final_url, headers=req_headers,
                                follow_redirects=True) as r:
                 if r.status_code == 416:  # already complete
                     break
