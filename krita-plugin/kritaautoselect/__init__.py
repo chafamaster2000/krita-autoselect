@@ -413,9 +413,20 @@ class AutoSelectDocker(DockWidget):
         if self._goto_check.isChecked():
             self._zoom_to_selection()
 
+    # Cada modo del combo mapea a la variante nativa de "Select Opaque".
+    SELECT_OPAQUE_ACTIONS = {
+        "replace": "selectopaque",
+        "add": "selectopaque_add",
+        "subtract": "selectopaque_subtract",
+        "intersect": "selectopaque_intersect",
+    }
+
     def _apply_mask(self, mask_b64):
-        """Máscara PNG → Selection, con el modo del combo y feather opcional.
-        Mismo mecanismo que la acción select_from_mask de kritamcp."""
+        """Máscara PNG → selección vía el "Seleccionar opaco" nativo de Krita
+        sobre una capa temporal. Es el único camino que genera el contorno
+        (línea punteada): las selecciones armadas con setPixelData nunca
+        muestran marching ants. El feather se aplica como blur de la máscara
+        ANTES, así la selección suave conserva su contorno."""
         doc = Krita.instance().activeDocument()
         if doc is None:
             raise RuntimeError("no hay documento")
@@ -426,32 +437,50 @@ class AutoSelectDocker(DockWidget):
             img = img.scaled(w, h, Qt.IgnoreAspectRatio,
                              Qt.SmoothTransformation)
         img = img.convertToFormat(QImage.Format_Grayscale8)
-        bpl = img.bytesPerLine()
-        raw = img.constBits().asstring(bpl * h)
-        data = raw if bpl == w else b"".join(
-            raw[i * bpl:i * bpl + w] for i in range(h))
-        sel = Selection()
-        sel.setPixelData(data, 0, 0, w, h)
 
-        mode = self._mode.currentData()
-        current = doc.selection()
-        if mode == "replace" or current is None:
-            target = sel
-        elif mode == "add":
-            current.add(sel)
-            target = current
-        elif mode == "subtract":
-            current.subtract(sel)
-            target = current
-        else:
-            current.intersect(sel)
-            target = current
         feather = self._feather.value()
         if feather > 0:
-            target.feather(feather)
-        doc.setSelection(target)
-        # Refresco explícito: sin esto la línea punteada (marching ants) a
-        # veces no se redibuja hasta el próximo repaint natural del canvas.
+            # Blur barato sin dependencias: downscale + upscale suavizado.
+            factor = max(1, int(feather))
+            small_w = max(1, w // (factor + 1))
+            small_h = max(1, h // (factor + 1))
+            img = (img
+                   .scaled(small_w, small_h, Qt.IgnoreAspectRatio,
+                           Qt.SmoothTransformation)
+                   .scaled(w, h, Qt.IgnoreAspectRatio,
+                           Qt.SmoothTransformation))
+
+        mode = self._mode.currentData()
+        action_name = self.SELECT_OPAQUE_ACTIONS.get(mode, "selectopaque")
+        if mode in ("subtract", "intersect") and doc.selection() is None:
+            raise RuntimeError("no hay selección previa para combinar")
+
+        bpl = img.bytesPerLine()
+        raw = img.constBits().asstring(bpl * h)
+        tight = raw if bpl == w else b"".join(
+            raw[i * bpl:i * bpl + w] for i in range(h))
+        argb = bytearray(w * h * 4)
+        argb[0::4] = tight
+        argb[1::4] = tight
+        argb[2::4] = tight
+        argb[3::4] = tight
+        prev = doc.activeNode()
+        tmp = doc.createNode("__autoselect_tmp", "paintlayer")
+        doc.rootNode().addChildNode(tmp, None)
+        try:
+            tmp.setPixelData(bytes(argb), 0, 0, w, h)
+            doc.setActiveNode(tmp)
+            doc.waitForDone()
+            action = Krita.instance().action(action_name)
+            if action is None:
+                raise RuntimeError(f"acción no encontrada: {action_name}")
+            action.trigger()
+            QApplication.processEvents()
+            doc.waitForDone()
+        finally:
+            if prev is not None:
+                doc.setActiveNode(prev)
+            tmp.remove()
         doc.refreshProjection()
 
     # ----- feedback visual: "mostrame lo que seleccionaste" -----
