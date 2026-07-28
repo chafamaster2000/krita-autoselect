@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=kritaautoselect
+X-Python-2-Compatible=false
+X-Krita-Manual=
+Name=AI Select (SAM)
+Comment=Seleccion por segmentacion: prompt de texto o click sobre el objeto, via el daemon krita-autoselect (SAM 3)
