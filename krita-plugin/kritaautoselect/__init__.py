@@ -211,7 +211,7 @@ class AutoSelectDocker(DockWidget):
         opts.addWidget(self._feather)
         layout.addLayout(opts)
 
-        self._goto_check = QCheckBox("Ir a la selección (zoom + resaltado)")
+        self._goto_check = QCheckBox("Ir a la selección (zoom)")
         self._goto_check.setChecked(True)
         layout.addWidget(self._goto_check)
 
@@ -412,7 +412,6 @@ class AutoSelectDocker(DockWidget):
             f"Seleccioné {data['count']} {plural} (score {best})", "green")
         if self._goto_check.isChecked():
             self._zoom_to_selection()
-            self._pulse_selection_mask()
 
     def _apply_mask(self, mask_b64):
         """Máscara PNG → Selection, con el modo del combo y feather opcional.
@@ -451,30 +450,11 @@ class AutoSelectDocker(DockWidget):
         if feather > 0:
             target.feather(feather)
         doc.setSelection(target)
+        # Refresco explícito: sin esto la línea punteada (marching ants) a
+        # veces no se redibuja hasta el próximo repaint natural del canvas.
+        doc.refreshProjection()
 
     # ----- feedback visual: "mostrame lo que seleccionaste" -----
-
-    def _pulse_selection_mask(self):
-        """Flash de la máscara de selección global (~1.5s): resalta en rosa
-        todo lo NO seleccionado y se apaga sola. Si el usuario ya la tenía
-        activa, no se toca."""
-        try:
-            action = Krita.instance().action("show-global-selection-mask")
-            if action is None or action.isChecked():
-                return
-
-            action.trigger()
-
-            def off():
-                try:
-                    if action.isChecked():
-                        action.trigger()
-                except Exception:
-                    pass
-
-            QTimer.singleShot(1500, off)
-        except Exception:
-            pass
 
     def _zoom_to_selection(self):
         """Encajar la selección en ~40% del viewport y centrarla. El factor
