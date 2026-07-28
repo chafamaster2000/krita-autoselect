@@ -91,6 +91,21 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(engine.calls[-1]["combine"], 2)
 
+    def test_segment_within_passthrough(self):
+        engine = FakeEngine()
+        url = self._serve(engine)
+        status, _ = self._post(url, "/segment", {
+            "image_b64": "aW1n", "text": "hand", "within": [10, 20, 300, 200]})
+        self.assertEqual(status, 200)
+        self.assertEqual(engine.calls[-1]["within"], [10, 20, 300, 200])
+
+    def test_segment_within_alone_is_valid_prompt(self):
+        engine = FakeEngine()
+        url = self._serve(engine)
+        status, _ = self._post(url, "/segment", {
+            "image_b64": "aW1n", "within": [0, 0, 50, 50]})
+        self.assertEqual(status, 200)
+
     def test_segment_requires_some_prompt(self):
         url = self._serve(FakeEngine())
         status, data = self._post(url, "/segment", {"image_b64": "aW1n"})

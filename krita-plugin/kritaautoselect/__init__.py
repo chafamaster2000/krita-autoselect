@@ -19,8 +19,10 @@ from PyQt5.QtGui import QColor, QImage, QPalette
 from PyQt5.QtWidgets import (
     QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QOpenGLWidget,
-    QPlainTextEdit, QPushButton, QSpinBox, QToolButton, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QRubberBand, QSpinBox, QToolButton,
+    QVBoxLayout, QWidget,
 )
+from PyQt5.QtCore import QPoint, QRect, QSize
 from PyQt5.QtCore import QBuffer, QByteArray, QIODevice
 import base64
 import http.client
@@ -108,6 +110,10 @@ class CanvasClickFilter(QObject):
     # x, y, kind: "new" = objeto nuevo, "pos" = refinar (Shift),
     # "neg" = excluir parte (Ctrl)
     clicked = pyqtSignal(int, int, str)
+    # x, y, w, h en coordenadas de documento (arrastre tipo marquesina)
+    dragged = pyqtSignal(int, int, int, int)
+
+    DRAG_THRESHOLD_PX = 8
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -115,38 +121,88 @@ class CanvasClickFilter(QObject):
         # Krita, que también filtra a nivel app); solo actúa sobre eventos
         # cuyo receptor es el canvas.
         self.canvas_widgets = []
+        self._press_pos = None
+        self._press_widget = None
+        self._rubber = None
+
+    def _doc_point(self, event):
+        window = Krita.instance().activeWindow()
+        view = window.activeView() if window else None
+        doc = Krita.instance().activeDocument()
+        if view is None or doc is None or \
+                not hasattr(view, "flakeToImageTransform"):
+            return None, None
+        point = view.flakeToImageTransform().map(QPointF(event.pos()))
+        return (int(point.x()), int(point.y())), doc
 
     def eventFilter(self, obj, event):
         try:
             etype = event.type()
+            if obj not in self.canvas_widgets:
+                return False
+            if etype == QEvent.MouseMove:
+                if self._press_pos is None:
+                    return False  # hover normal: no tocar
+                if self._rubber is None and \
+                        (event.pos() - self._press_pos).manhattanLength() > \
+                        self.DRAG_THRESHOLD_PX:
+                    self._rubber = QRubberBand(QRubberBand.Rectangle,
+                                               self._press_widget)
+                if self._rubber is not None:
+                    self._rubber.setGeometry(
+                        QRect(self._press_pos, event.pos()).normalized())
+                    self._rubber.show()
+                return True
             if etype not in (QEvent.MouseButtonPress,
                              QEvent.MouseButtonRelease,
                              QEvent.MouseButtonDblClick):
                 return False
-            if obj not in self.canvas_widgets:
-                return False
             if event.button() != Qt.LeftButton:
                 return False
-            if etype != QEvent.MouseButtonPress:
-                return True  # release/dblclick del par: solo tragarlo
-            window = Krita.instance().activeWindow()
-            view = window.activeView() if window else None
-            doc = Krita.instance().activeDocument()
-            if view is None or doc is None:
-                return False
-            if not hasattr(view, "flakeToImageTransform"):
-                return False  # Krita < 5.2: sin mapeo confiable
-            transform = view.flakeToImageTransform()
-            point = transform.map(QPointF(event.pos()))
-            x, y = int(point.x()), int(point.y())
-            if 0 <= x < doc.width() and 0 <= y < doc.height():
+            if etype == QEvent.MouseButtonDblClick:
+                return True
+            if etype == QEvent.MouseButtonPress:
+                self._press_pos = QPoint(event.pos())
+                self._press_widget = obj
+                return True
+
+            # MouseButtonRelease: ¿fue click o arrastre?
+            press_pos = self._press_pos
+            was_drag = self._rubber is not None
+            if self._rubber is not None:
+                self._rubber.hide()
+                self._rubber.deleteLater()
+                self._rubber = None
+            self._press_pos = None
+            self._press_widget = None
+            if press_pos is None:
+                return True
+
+            (x2, y2), doc = self._doc_point(event)
+            if doc is None:
+                return True
+
+            if was_drag:
+                view = Krita.instance().activeWindow().activeView()
+                p1 = view.flakeToImageTransform().map(QPointF(press_pos))
+                x1, y1 = int(p1.x()), int(p1.y())
+                bx, by = min(x1, x2), min(y1, y2)
+                bw, bh = abs(x2 - x1), abs(y2 - y1)
+                bx, by = max(0, bx), max(0, by)
+                bw = min(bw, doc.width() - bx)
+                bh = min(bh, doc.height() - by)
+                if bw > 4 and bh > 4:
+                    self.dragged.emit(bx, by, bw, bh)
+                return True
+
+            if 0 <= x2 < doc.width() and 0 <= y2 < doc.height():
                 if event.modifiers() & Qt.ControlModifier:
                     kind = "neg"
                 elif event.modifiers() & Qt.ShiftModifier:
                     kind = "pos"
                 else:
                     kind = "new"
-                self.clicked.emit(x, y, kind)
+                self.clicked.emit(x2, y2, kind)
             return True
         except Exception:
             return False  # jamás dejar que una excepción suba al event loop
@@ -163,6 +219,8 @@ class AutoSelectDocker(DockWidget):
         self._client.health.connect(self._on_health, Qt.QueuedConnection)
         self._click_filter = CanvasClickFilter(self)
         self._click_filter.clicked.connect(self._on_canvas_click,
+                                           Qt.QueuedConnection)
+        self._click_filter.dragged.connect(self._on_canvas_drag,
                                            Qt.QueuedConnection)
         self._filtered_widgets = []
         self._server_process = None
@@ -237,6 +295,8 @@ class AutoSelectDocker(DockWidget):
         self._click_btn.setCheckable(True)
         self._click_btn.setToolTip(
             "Modo click: tocá un objeto en el canvas para seleccionarlo.\n"
+            "Arrastrá un recuadro: el objeto de adentro (con prompt escrito: "
+            "las instancias del prompt que caigan adentro).\n"
             "Shift+click: sumar un punto de refinamiento al mismo objeto.\n"
             "Ctrl+click: excluir esa parte del objeto.")
         self._click_btn.setFixedSize(34, 32)
@@ -403,6 +463,18 @@ class AutoSelectDocker(DockWidget):
             self._click_labels.append(0 if kind == "neg" else 1)
         self._segment({"points": list(self._click_points),
                        "point_labels": list(self._click_labels)})
+
+    def _on_canvas_drag(self, x, y, w, h):
+        """Arrastre tipo marquesina. Sin prompt: el objeto dentro del
+        recuadro. Con prompt: instancias del concepto que caen adentro
+        ("encontrá la mano acá adentro")."""
+        self._click_points = []
+        self._click_labels = []
+        text = self._prompt.toPlainText().strip()
+        if text:
+            self._segment({"text": text, "within": [x, y, w, h]})
+        else:
+            self._segment({"box": [x, y, w, h]})
 
     def _segment(self, prompt_payload):
         if self._busy:
@@ -579,9 +651,8 @@ class AutoSelectDocker(DockWidget):
                 self._click_btn.setChecked(False)
                 return
             self._set_status(
-                "Modo click: tocá el objeto. Shift+click refina, "
-                "Ctrl+click excluye. Volvé a apretar el botón para salir.",
-                "green")
+                "Modo click: tocá el objeto o arrastrá un recuadro. "
+                "Shift+click refina, Ctrl+click excluye.", "green")
         else:
             self._detach_click_filter()
             self._click_points = []

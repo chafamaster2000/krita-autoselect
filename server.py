@@ -45,7 +45,7 @@ def parse_segment_params(payload):
         raise BadRequest("Body must be a JSON object")
     if not payload.get("image_b64"):
         raise BadRequest("image_b64 is required")
-    if not any(payload.get(k) for k in VALID_PROMPT_KEYS):
+    if not any(payload.get(k) for k in VALID_PROMPT_KEYS + ("within",)):
         raise BadRequest("At least one prompt is required: text, points or box")
 
     points = payload.get("points")
@@ -56,6 +56,9 @@ def parse_segment_params(payload):
     box = payload.get("box")
     if box is not None and (not isinstance(box, list) or len(box) != 4):
         raise BadRequest("box must be [x, y, width, height]")
+    within = payload.get("within")
+    if within is not None and (not isinstance(within, list) or len(within) != 4):
+        raise BadRequest("within must be [x, y, width, height]")
 
     combine = payload.get("combine", "union")
     if combine != "union":
@@ -80,6 +83,7 @@ def parse_segment_params(payload):
         "mask_threshold": mask_threshold,
         "combine": combine,
         "list_only": bool(payload.get("list_only", False)),
+        "within": within,
     }
 
 

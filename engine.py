@@ -216,12 +216,15 @@ class Sam3Engine:
 
     def segment(self, image_b64, text=None, points=None, point_labels=None,
                 box=None, threshold=0.5, mask_threshold=0.5,
-                combine="union", list_only=False):
+                combine="union", list_only=False, within=None):
         """Run SAM 3 and compose the final mask.
 
         Routing: a text prompt → concept mode (PCS, every matching instance;
         points/box refine the concept). Visual-only prompt → tracker mode
         (PVS, SAM2-style: the exact object under the clicks / in the box).
+
+        `within` = [x, y, w, h]: keep only instances mostly inside that
+        region — the "drag a box + verify it's a hand" gesture (text mode).
 
         Returns {"instances": [{index, score, box}], "width", "height",
         "count", "mask_b64"? } — mask_b64 is a canvas-sized grayscale PNG,
@@ -239,11 +242,32 @@ class Sam3Engine:
             instances, np_masks = self._segment_concept(
                 image, text, points, point_labels, box,
                 threshold, mask_threshold)
+            if within:
+                instances, np_masks = self._filter_within(
+                    instances, np_masks, within)
         else:
             instances, np_masks = self._segment_visual(
-                image, points, point_labels, box)
+                image, points, point_labels, box or within)
         return self._compose(image.size, instances, np_masks,
                              combine, list_only)
+
+    @staticmethod
+    def _filter_within(instances, np_masks, within, min_overlap=0.5):
+        """Keep instances whose bbox lies mostly inside `within` [x,y,w,h]."""
+        wx1, wy1 = float(within[0]), float(within[1])
+        wx2, wy2 = wx1 + float(within[2]), wy1 + float(within[3])
+        kept_instances, kept_masks = [], []
+        for inst, mask in zip(instances, np_masks):
+            x1, y1, x2, y2 = inst["box"]
+            area = max(1.0, (x2 - x1) * (y2 - y1))
+            ix1, iy1 = max(x1, wx1), max(y1, wy1)
+            ix2, iy2 = min(x2, wx2), min(y2, wy2)
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            if inter / area >= min_overlap:
+                inst = dict(inst, index=len(kept_instances))
+                kept_instances.append(inst)
+                kept_masks.append(mask)
+        return kept_instances, kept_masks
 
     def _segment_concept(self, image, text, points, point_labels, box,
                          threshold, mask_threshold):
