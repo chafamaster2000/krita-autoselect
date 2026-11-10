@@ -15,7 +15,7 @@ Env:
   AUTOSELECT_PORT            port (default 5679)
   AUTOSELECT_MODEL           HF model id (default facebook/sam3)
   AUTOSELECT_WEIGHTS_PATH    local model dir (skips Hugging Face entirely)
-  AUTOSELECT_DEVICE          cuda | cpu (default: auto)
+  AUTOSELECT_DEVICE          cuda | mps | cpu (default: auto)
   AUTOSELECT_DTYPE           bfloat16 | float16 | float32 (default: auto)
   AUTOSELECT_UNLOAD_AFTER_S  idle seconds before freeing VRAM; 0 = resident
                              (default 300)

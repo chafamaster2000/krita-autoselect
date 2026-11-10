@@ -44,11 +44,19 @@ at build time; the root files remain the only source.
   `%LOCALAPPDATA%\krita-autoselect`, `~/Library/Application Support/krita-autoselect`)
   with `uv` if available, otherwise the system `python3 -m venv`. It then
   installs torch (CUDA 12.8 wheels with an NVIDIA GPU, 12.6 for pre-Volta,
-  CPU otherwise) and the requirements, and downloads the gated weights (see
+  the default PyPI wheels on macOS, CPU otherwise) and the requirements,
+  and downloads the gated weights (see
   below) using the **Token HF** field or your `hf auth login`. Progress
   shows in the docker; **Cancelar** stops it, and running it again resumes.
   If you already have the weights, set **Pesos** to their folder and the
   download is skipped.
+- *macOS:* Apple Silicon only; the daemon runs on the GPU through MPS.
+  Intel Macs can't run it: PyTorch's last x86_64 macOS build is 2.2 and
+  SAM 3 needs a newer one, so the installer says so and stops. Krita opened
+  from the Finder doesn't see your shell's `PATH`, so the installer also
+  looks for `uv` in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`,
+  and for a Homebrew / python.org `python3` (never the Xcode
+  `/usr/bin/python3` stub).
 
 **Use it:** type a prompt and press *Seleccionar* (or Shift+Enter). If a
 healthy daemon already answers on the configured URL it is reused and never
@@ -89,6 +97,7 @@ The Krita plugin can do all of this for you (see above). By hand:
 python -m venv .venv
 # Windows: .venv/Scripts/pip …   Linux/macOS: .venv/bin/pip …
 .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# macOS (Apple Silicon): plain `pip install torch torchvision` (PyPI, with MPS)
 .venv/bin/pip install -r requirements.txt
 ```
 
@@ -128,8 +137,8 @@ directory containing the model files.
 | `AUTOSELECT_PORT` | `5679` | HTTP port |
 | `AUTOSELECT_MODEL` | `facebook/sam3` | Hugging Face model id |
 | `AUTOSELECT_WEIGHTS_PATH` | — | local model dir (skips HF entirely) |
-| `AUTOSELECT_DEVICE` | auto | `cuda` / `cpu` |
-| `AUTOSELECT_DTYPE` | auto | `bfloat16` (cuda) / `float16` / `float32` |
+| `AUTOSELECT_DEVICE` | auto | `cuda` / `mps` (Apple Silicon) / `cpu` |
+| `AUTOSELECT_DTYPE` | auto | `bfloat16` (cuda) / `float16` / `float32` (mps, cpu) |
 | `AUTOSELECT_UNLOAD_AFTER_S` | `300` | idle seconds before freeing VRAM; `0` = resident |
 | `AUTOSELECT_COMFYUI_URL` | `http://127.0.0.1:8001` | ComfyUI to ask for VRAM; empty disables |
 | `AUTOSELECT_TOKEN` | — | require `X-Autoselect-Token` header |

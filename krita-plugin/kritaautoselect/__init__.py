@@ -223,10 +223,11 @@ def _build_plan(cfg):
     system_python = None if uv else bk.find_system_python(env, prefixes=prefixes)
     gpu = bk.detect_nvidia_gpu(env, prefixes=prefixes)
     token, source = bk.find_hf_token(cfg.hf_token)
+    mac_cpu = bk.macos_cpu() if bk.platform_id() == "macos" else None
     steps = bk.build_install_plan(
         cfg.install_dir, BUNDLED_DIR, uv=uv, system_python=system_python,
         gpu=gpu, weights_setting=cfg.weights_setting, hf_token=token,
-        hf_token_from_setting=bool(cfg.hf_token))
+        hf_token_from_setting=bool(cfg.hf_token), mac_cpu=mac_cpu)
     info = (f"carpeta {cfg.install_dir} · "
             f"{'uv ' + uv if uv else 'python ' + ' '.join(system_python)} · "
             f"GPU {gpu['name'] if gpu else 'ninguna NVIDIA'} · "
