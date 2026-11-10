@@ -18,6 +18,7 @@ import os
 import platform as _pyplatform
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 
@@ -40,6 +41,23 @@ WEIGHT_MARKERS = ("config.json", "model.safetensors")
 VENV_DIR_NAMES = (".venv", "venv")
 PYTHON_FOR_UV = "3.12"
 MIN_SYSTEM_PYTHON = (3, 10)
+# Sin uv, en Linux/macOS: el python3 del sistema y, si no sirve (viejo o sin
+# ensurepip), versiones explícitas que suelen convivir (deadsnakes, etc.).
+POSIX_PYTHON_NAMES = ("python3", "python3.12", "python3.13", "python3.11",
+                      "python3.14", "python3.10")
+# Debian/Ubuntu separan ensurepip en python3-venv: sin él, `-m venv` falla
+# y deja un venv a medias (bin/python sin pip).
+PYTHON_PROBE_CODE = (
+    "import sys\n"
+    "try:\n"
+    "    import ensurepip, venv\n"
+    "    ok = 1\n"
+    "except ImportError:\n"
+    "    ok = 0\n"
+    "print('%d.%d %d' % (sys.version_info[0], sys.version_info[1], ok))\n"
+)
+VENV_HINT = ("en Debian/Ubuntu instalá python3-venv (sudo apt install "
+             "python3-venv), o instalá uv (https://docs.astral.sh/uv/)")
 
 TORCH_INDEX = "https://download.pytorch.org/whl/"
 # cu128 ya no trae kernels para Maxwell/Pascal (compute capability < 7.0);
@@ -176,14 +194,26 @@ def find_daemon_file(name, bundled_dir, install_dir, isfile=os.path.isfile):
     return None
 
 
+def venv_broken(install_dir, platform=None, isfile=os.path.isfile):
+    """¿Hay un venv (pyvenv.cfg) cuyo intérprete ya no existe? Pasa en Linux
+    cuando el venv apuntaba a /usr/bin/python3.X y la distro actualizó Python."""
+    if not install_dir or find_venv_python(install_dir, platform, isfile):
+        return False
+    plat = platform_id(platform)
+    return any(isfile(_join(plat, install_dir, name, "pyvenv.cfg"))
+               for name in VENV_DIR_NAMES)
+
+
 class Install:
     """Instalación resuelta: qué python corre qué server con qué pesos."""
 
-    def __init__(self, install_dir, python, server_script, weights):
+    def __init__(self, install_dir, python, server_script, weights,
+                 venv_broken=False):
         self.install_dir = install_dir
         self.python = python
         self.server_script = server_script
         self.weights = weights
+        self.venv_broken = venv_broken
 
     @property
     def ok(self):
@@ -191,6 +221,10 @@ class Install:
 
     def problem(self):
         """Motivo legible (UI en castellano) si no está lista, o None."""
+        if not self.python and self.venv_broken:
+            return (f"El entorno Python de {self.install_dir} está roto: su "
+                    "intérprete ya no existe (¿se actualizó el Python del "
+                    "sistema?). «Instalar backend» lo recrea.")
         if not self.python:
             return (f"No hay entorno Python en {self.install_dir} "
                     "(falta .venv). Usá «Instalar backend» o apuntá a una "
@@ -211,6 +245,7 @@ def resolve_install(install_dir, weights_setting, bundled_dir, platform=None,
         server_script=find_daemon_file("server.py", bundled_dir, install_dir,
                                        isfile),
         weights=resolve_weights(weights_setting, install_dir, platform, isfile),
+        venv_broken=venv_broken(install_dir, platform, isfile),
     )
 
 
@@ -289,6 +324,18 @@ def probe_health(url, timeout=2.0):
             conn.close()
     except (OSError, http.client.HTTPException) as e:
         return HealthProbe("down", error=f"{type(e).__name__}: {e}")
+
+
+def request_error(exc, timeout):
+    """Error de red de un pedido al daemon → dict para el docker. "_conn"
+    (reintentar tras el reinicio) solo si la conexión se cayó: un timeout es
+    el daemon todavía calculando (sin GPU, SAM 3 en CPU tarda minutos) y
+    reintentar encolaría el mismo trabajo otra vez."""
+    if isinstance(exc, socket.timeout):
+        return {"error": f"El backend no respondió en {timeout:.0f} s (sin "
+                         "GPU, SAM 3 en CPU puede tardar minutos). Probá de "
+                         "nuevo cuando termine."}
+    return {"error": f"Sin conexión con el server ({exc})", "_conn": True}
 
 
 # Acciones de decide_action().
@@ -532,15 +579,28 @@ def pick_comfyui_url(candidates, probe=probe_comfyui):
 # ----------------------------------------------------------------------------
 
 def hf_token_paths(environ=None, platform=None):
+    """Dónde deja el token `hf auth login`, en el orden de huggingface_hub
+    (HF_TOKEN_PATH, HF_HOME, XDG_CACHE_HOME), y al final siempre
+    ~/.cache/huggingface/token: en Krita Flatpak XDG_CACHE_HOME apunta al
+    sandbox (~/.var/app/org.kde.krita/cache) pero el login se hizo afuera."""
     environ = os.environ if environ is None else environ
+    home = _home(environ, platform)
+
+    def expand(path):  # huggingface_hub hace expanduser
+        return home + path[1:] if path == "~" or path.startswith("~/") \
+            else path
+
     paths = []
     if environ.get("HF_TOKEN_PATH"):
-        paths.append(environ["HF_TOKEN_PATH"])
+        paths.append(expand(environ["HF_TOKEN_PATH"]))
     if environ.get("HF_HOME"):
-        paths.append(os.path.join(environ["HF_HOME"], "token"))
-    cache = environ.get("XDG_CACHE_HOME") or os.path.join(
-        _home(environ, platform), ".cache")
-    paths.append(os.path.join(cache, "huggingface", "token"))
+        paths.append(os.path.join(expand(environ["HF_HOME"]), "token"))
+    if environ.get("XDG_CACHE_HOME"):
+        paths.append(os.path.join(expand(environ["XDG_CACHE_HOME"]),
+                                  "huggingface", "token"))
+    default = os.path.join(home, ".cache", "huggingface", "token")
+    if default not in paths:
+        paths.append(default)
     return paths
 
 
@@ -578,14 +638,17 @@ class PlanError(RuntimeError):
 
 
 class Step:
-    """Un paso del instalador: un comando, o un paso salteado (resume)."""
+    """Un paso del instalador: un comando, o un paso salteado (resume).
+    hint: qué hacer si falla (se suma al mensaje de error)."""
 
-    def __init__(self, key, title, argv=None, env=None, skip_reason=None):
+    def __init__(self, key, title, argv=None, env=None, skip_reason=None,
+                 hint=None):
         self.key = key
         self.title = title
         self.argv = argv
         self.env = env or {}
         self.skip_reason = skip_reason
+        self.hint = hint
 
     @property
     def skipped(self):
@@ -669,6 +732,62 @@ def find_system_python(environ=None, platform=None, which=shutil.which,
         if isfile(candidate) and not _under(candidate, prefixes):
             return [candidate]
     return None
+
+
+def check_venv_python(argv, run=subprocess.run, env=None):
+    """¿Sirve este Python para `-m venv` + pip? → (versión | None, problema).
+    problema es "" si sirve: ≥ MIN_SYSTEM_PYTHON y con ensurepip. env: el
+    entorno ya saneado (sin el PYTHONPATH de Krita), como el del instalador."""
+    exe = argv[0]
+    try:
+        proc = run(list(argv) + ["-c", PYTHON_PROBE_CODE], capture_output=True,
+                   text=True, timeout=30, env=env)
+        ver, ok = proc.stdout.split()[:2]
+        version = tuple(int(x) for x in ver.split("."))
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"{exe}: no se pudo ejecutar ({e})"
+    except (AttributeError, ValueError):
+        return None, f"{exe}: no responde como Python"
+    name = "%d.%d" % version
+    if version < MIN_SYSTEM_PYTHON:
+        return version, (f"{exe} es Python {name}; hace falta "
+                         f"{'%d.%d' % MIN_SYSTEM_PYTHON} o más nuevo")
+    if ok != "1":
+        return version, (f"{exe} (Python {name}) no trae ensurepip: en "
+                         f"Debian/Ubuntu falta el paquete python{name}-venv")
+    return version, ""
+
+
+def pick_system_python(environ=None, platform=None, which=shutil.which,
+                       isfile=os.path.isfile, prefixes=(), run=subprocess.run):
+    """(argv | None, problema): el primer Python del sistema que puede crear
+    un venv con pip. En Linux/macOS prueba python3 y python3.X (lo corre:
+    versión y ensurepip). En Windows es find_system_python, sin probar."""
+    environ = os.environ if environ is None else environ
+    plat = platform_id(platform)
+    if plat == "windows":
+        return find_system_python(environ, plat, which, isfile, prefixes), ""
+    dirs = ["/usr/bin", "/usr/local/bin"]
+    if plat == "macos":
+        dirs.append("/opt/homebrew/bin")
+    candidates = []
+    for name in POSIX_PYTHON_NAMES:
+        found = _which(name, environ, prefixes, which)
+        candidates += [found] if found else []
+        candidates += [d + "/" + name for d in dirs
+                       if isfile(d + "/" + name)
+                       and not _under(d + "/" + name, prefixes)]
+    seen, problems = set(), []
+    for path in candidates:
+        real = os.path.realpath(path)  # python3 -> python3.12: probar 1 vez
+        if real in seen:
+            continue
+        seen.add(real)
+        _, problem = check_venv_python([path], run, dict(environ))
+        if not problem:
+            return [path], ""
+        problems.append(problem)
+    return None, "; ".join(problems)
 
 
 def parse_nvidia_smi(output):
@@ -759,15 +878,53 @@ def torch_variant(platform=None, gpu=None):
     return TORCH_INDEX + "cpu", "CPU (sin GPU NVIDIA)"
 
 
+def is_flatpak(environ=None, isfile=os.path.isfile):
+    """¿Krita corre dentro de Flatpak (org.kde.krita)?"""
+    environ = os.environ if environ is None else environ
+    return bool(environ.get("FLATPAK_ID")) or isfile("/.flatpak-info")
+
+
+FLATPAK_NOTE = (
+    "el backend se instala y corre DENTRO del sandbox de Flatpak. Ahí no se "
+    "ve la GPU NVIDIA (ni nvidia-smi ni /dev/nvidia*; Krita Flatpak no puede "
+    "lanzar procesos fuera con flatpak-spawn --host), así que va PyTorch CPU "
+    "(lento). Para usar CUDA: instalá y corré el daemon fuera de Flatpak "
+    "(README, sección Linux) y el plugin lo reusa por la URL.")
+AMD_NOTE = (
+    "hay una GPU AMD (/dev/kfd) pero el instalador solo arma CUDA o CPU: va "
+    "PyTorch CPU. Para ROCm, reinstalá torch en el venv con el índice ROCm "
+    "de pytorch.org (pip install torch torchvision --index-url "
+    "https://download.pytorch.org/whl/rocmX.Y); el daemon lo usa igual.")
+
+
+def install_notes(platform=None, environ=None, gpu=None,
+                  exists=os.path.exists):
+    """[(título, texto)]: avisos del entorno para el log del instalador."""
+    if platform_id(platform) != "linux":
+        return []
+    notes = []
+    if is_flatpak(environ, exists):
+        notes.append(("Krita Flatpak", FLATPAK_NOTE))
+    if not gpu and exists("/dev/kfd"):
+        notes.append(("GPU AMD", AMD_NOTE))
+    return notes
+
+
 def build_install_plan(install_dir, bundled_dir, platform=None, uv=None,
                        system_python=None, gpu=None, weights_setting="",
                        hf_token=None, hf_token_from_setting=False,
-                       isfile=os.path.isfile, venv_exists=None, mac_cpu=None):
+                       isfile=os.path.isfile, venv_exists=None, mac_cpu=None,
+                       python_problem=""):
     """Lista de Step para instalar (o retomar) el backend en install_dir.
 
     Cada paso es idempotente: el venv existente se saltea, uv/pip no
     reinstalan lo que ya está y el descargador de pesos retoma archivos a
-    medias. Por eso re-ejecutar el instalador es seguro."""
+    medias. Por eso re-ejecutar el instalador es seguro.
+
+    system_python solo hace falta sin uv y sin venv usable; python_problem
+    explica por qué no se encontró uno (pick_system_python). El token HF
+    encontrado siempre se le pasa al descargador (hf_token_from_setting
+    quedó sin efecto): en Flatpak el hijo no ve el login de afuera."""
     plat = platform_id(platform)
     if not install_dir:
         raise PlanError("Falta la carpeta de instalación.")
@@ -780,27 +937,46 @@ def build_install_plan(install_dir, bundled_dir, platform=None, uv=None,
     if not requirements or not downloader:
         raise PlanError("El plugin no trae los archivos del backend "
                         "(carpeta daemon/). Reinstalalo desde el zip.")
-    if not uv and not system_python:
-        raise PlanError("No encontré uv ni un python3 del sistema para crear "
-                        "el entorno. Instalá uv (https://docs.astral.sh/uv/) "
-                        "o Python 3.10+ y volvé a intentar.")
-
     venv_dir = _join(plat, install_dir, ".venv")
     existing = find_venv_python(install_dir, plat, isfile)
     py = existing or venv_python(venv_dir, plat)
     steps = []
+    if not uv and not system_python and not existing:
+        why = f" ({python_problem})" if python_problem else ""
+        raise PlanError("No encontré uv ni un Python del sistema que pueda "
+                        f"crear el entorno{why}. Instalá uv (recomendado, "
+                        "trae su propio Python: https://docs.astral.sh/uv/) o "
+                        "Python 3.10+ con venv (Debian/Ubuntu: sudo apt "
+                        "install python3-venv) y volvé a intentar.")
 
     # 1. Entorno Python
     if existing:
         steps.append(Step("venv", "Entorno Python",
                           skip_reason=f"ya existe ({existing})"))
+        # Sin uv hace falta pip adentro: un venv de uv no lo trae, y uno de
+        # `python3 -m venv` que falló por falta de ensurepip quedó sin él.
+        bin_dir = existing.rsplit("\\" if plat == "windows" else "/", 1)[0]
+        pip_path = _join(plat, bin_dir,
+                         "pip.exe" if plat == "windows" else "pip")
+        if not uv and not isfile(pip_path):
+            steps.append(Step("pip", "Instalar pip en el entorno (ensurepip)",
+                              [py, "-m", "ensurepip", "--upgrade",
+                               "--default-pip"], hint=VENV_HINT))
     elif uv:
         steps.append(Step("venv", f"Crear entorno Python {PYTHON_FOR_UV} (uv)",
                           [uv, "venv", "--python", PYTHON_FOR_UV,
                            "--allow-existing", venv_dir]))
+    elif venv_broken(install_dir, plat, isfile):
+        # `-m venv` sobre un venv cuyo python desapareció no lo arregla
+        # (deja bin/python colgando): hay que recrearlo.
+        steps.append(Step("venv", "Recrear entorno Python roto "
+                          "(python -m venv --clear)",
+                          list(system_python) + ["-m", "venv", "--clear",
+                                                 venv_dir], hint=VENV_HINT))
     else:
         steps.append(Step("venv", "Crear entorno Python (python -m venv)",
-                          list(system_python) + ["-m", "venv", venv_dir]))
+                          list(system_python) + ["-m", "venv", venv_dir],
+                          hint=VENV_HINT))
 
     def pip(*args):
         if uv:
@@ -833,7 +1009,7 @@ def build_install_plan(install_dir, bundled_dir, platform=None, uv=None,
                 "facebook/sam3 y pegá un token en la configuración (o "
                 "corré `hf auth login`). Si ya tenés los pesos, poné su "
                 "carpeta en «Pesos».")
-        env = {"HF_TOKEN": hf_token} if hf_token_from_setting else {}
+        env = {"HF_TOKEN": hf_token}
         steps.append(Step("weights", "Descargar pesos de SAM 3 (~3.4 GB, "
                           "se puede retomar)",
                           [py, "-u", downloader, target], env=env))

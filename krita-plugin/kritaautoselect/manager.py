@@ -314,11 +314,11 @@ class DaemonManager:
         _, port = bk.parse_url(cfg.url)
         base = self._base_env if self._base_env is not None else \
             bk.sanitize_env(os.environ, bk.krita_prefixes())
-        # Solo el token del setting: el login de `hf auth login` el daemon
-        # ya lo lee solo.
+        # El token se pasa siempre: en Krita Flatpak el daemon no ve el login
+        # de `hf auth login` hecho fuera del sandbox (XDG_CACHE_HOME).
+        token, _ = bk.find_hf_token(cfg.hf_token, base)
         env = bk.daemon_env(base, port, install.weights, cfg.unload_after_s,
-                            self._comfyui_url(cfg),
-                            (cfg.hf_token or "").strip())
+                            self._comfyui_url(cfg), token or "")
         log = open(cfg.daemon_log, "ab")
         try:
             header = (f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -370,6 +370,18 @@ class DaemonManager:
                     rc = proc.poll()
             if session.stop_event.is_set():
                 break
+            # ¿Contesta otro daemon en la URL? Pasa cuando dos Kritas lo
+            # arrancan a la vez: el nuestro no pudo tomar el puerto (código 3)
+            # o murió y el puerto ya es de otro. Se reusa ese, sin relanzar.
+            other = self._probe(cfg.url, timeout=1.0)
+            if other.kind == "autoselect":
+                session.stop_event.set()
+                self._forget(session)
+                self._append_log(cfg, f"[AI Select] el daemon propio salió "
+                                      f"({bk.describe_exit(rc)}) y otro ya "
+                                      f"atiende {cfg.url}: se reusa ese\n")
+                self._set_ready(other)
+                return
             restart, delay, reason = session.policy.on_exit(
                 rc, healthy, time.monotonic())
             tail = bk.tail_file(cfg.daemon_log, 60)
@@ -590,6 +602,8 @@ class InstallRunner:
                 if rc != 0:
                     ok, msg = False, (f"falló «{step.title}» "
                                       f"({bk.describe_exit(rc)})")
+                    if getattr(step, "hint", None):
+                        msg += f" — {step.hint}"
                     self._emit(log, "✗ " + msg)
                     return
             ok, msg = True, "Backend instalado"

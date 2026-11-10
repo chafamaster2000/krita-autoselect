@@ -75,6 +75,47 @@ the idle seconds before VRAM is released and the ComfyUI URL asked to free
 VRAM (blank = auto: AI Diffusion's configured server, then ports 8188 and
 8001). Settings live in `kritarc`, under `[kritaautoselect]`.
 
+Several Krita instances share one daemon: whichever starts it first owns
+it, the others reuse it. When the owner quits, the daemon stops and the
+next selection in another instance starts a new one.
+
+### Linux
+
+- **AppImage** (krita.org): works as is. Before running uv, pip or the
+  daemon, the plugin strips what Krita puts in the environment for its own
+  Python (`PYTHONPATH`, `PYTHONHOME`, and `$APPDIR` entries in `PATH`,
+  `LD_LIBRARY_PATH` and `QT_PLUGIN_PATH`).
+- **Distro packages**: Krita runs the plugin with the system Python and
+  PyQt. On Arch, install `python-pyqt6`, an optional dependency without
+  which Krita loads no Python plugins.
+- **No uv**: the installer needs Python 3.10+ that can create a venv. It
+  tries `python3`, then `python3.12`, `3.13`, `3.11`, `3.14` and `3.10`,
+  and checks each one before creating anything. Debian and Ubuntu ship
+  `ensurepip` separately, so run `sudo apt install python3-venv` (or
+  `python3.X-venv`). uv is easier: it brings its own Python 3.12.
+- **No NVIDIA GPU**: torch comes from the CPU index (a 210 MB wheel
+  instead of more than 2 GB of CUDA wheels), and segmentation runs on the
+  CPU. That is slow: one to two minutes per request on a 12-thread desktop
+  CPU. The installer does not set up AMD ROCm. To use it, reinstall torch
+  in the venv from the ROCm index listed on pytorch.org.
+- **Flatpak** (Flathub `org.kde.krita`): plugins go in
+  `~/.var/app/org.kde.krita/data/krita/pykrita`
+  (`python scripts/build_plugin.py --install <that folder>`), and the data
+  folder becomes `~/.var/app/org.kde.krita/data/krita-autoselect`. The
+  sandbox may not start host processes (no `flatpak-spawn --host`) and does
+  not expose the NVIDIA device, so whatever the plugin installs and runs
+  stays inside the sandbox, on the CPU. To use the GPU, run the daemon on
+  the host (manual install below, then `.venv/bin/python server.py`, or a
+  `systemd --user` unit). The sandbox shares the host network, so the plugin
+  finds and reuses it on `127.0.0.1:5679`. If you point **Instalación** at
+  a host install, its venv must come from uv: one created from
+  `/usr/bin/python3` does not run inside the sandbox.
+- **Snap**: the Krita snap has no Python scripting, so it cannot load this
+  plugin. Use the AppImage, Flatpak or distro package instead.
+- Paths follow `XDG_DATA_HOME` (data folder, AI Diffusion's settings) and
+  `HF_TOKEN_PATH`, `HF_HOME` or `XDG_CACHE_HOME` (the `hf auth login`
+  token), as huggingface_hub does.
+
 ## Design
 
 - **Lazy VRAM**: the model loads on first request and unloads after an idle

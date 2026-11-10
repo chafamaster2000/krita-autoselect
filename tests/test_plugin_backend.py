@@ -131,6 +131,32 @@ class DecisionTest(unittest.TestCase):
         self.assertTrue(bk.is_local_host("localhost"))
         self.assertFalse(bk.is_local_host("192.168.0.2"))
 
+    def test_request_timeout_is_not_retried_like_a_dropped_connection(self):
+        """CPU-only SAM 3 takes minutes: a client timeout means the daemon
+        is still working, and resending would queue the same job again."""
+        import socket
+        slow = bk.request_error(socket.timeout("timed out"), 300)
+        self.assertNotIn("_conn", slow)
+        self.assertIn("300 s", slow["error"])
+        dropped = bk.request_error(ConnectionResetError(104, "reset"), 300)
+        self.assertTrue(dropped["_conn"])
+        # and against a real server that accepts but never answers
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", srv.getsockname()[1],
+                                          timeout=0.3)
+        try:
+            conn.request("POST", "/segment", b"{}")
+            conn.getresponse()
+            self.fail("expected a timeout")
+        except (OSError, http.client.HTTPException) as e:
+            self.assertNotIn("_conn", bk.request_error(e, 0.3))
+        finally:
+            conn.close()
+
     def test_probe_health_down(self):
         import socket
         s = socket.socket()
@@ -270,7 +296,9 @@ class InstallPlanTest(unittest.TestCase):
         self.assertEqual(p["weights"].argv, [
             "/i/.venv/bin/python", "-u", "/p/daemon/download_weights.py",
             "/i/models/sam3"])
-        self.assertEqual(p["weights"].env, {})  # token comes from HF cache
+        # The token found is always handed over: a Flatpak child can't see
+        # the `hf auth login` made outside the sandbox.
+        self.assertEqual(p["weights"].env, {"HF_TOKEN": "tok"})
         self.assertEqual(p["verify"].argv[:2], ["/i/.venv/bin/python", "-c"])
 
     def test_pip_cpu_plan_without_uv(self):
@@ -327,11 +355,84 @@ class InstallPlanTest(unittest.TestCase):
                                                ["/tmp/.mount_k"]),
                          ["/usr/bin/python3"])
 
+    def test_pip_plan_creates_venv_with_hint(self):
+        p = self.plan(uv=None, system_python=["/usr/bin/python3.12"])
+        self.assertEqual(p["venv"].argv,
+                         ["/usr/bin/python3.12", "-m", "venv", "/i/.venv"])
+        self.assertIn("python3-venv", p["venv"].hint)
+        self.assertNotIn("pip", p)
+
+    def test_pip_plan_repairs_venv_without_pip(self):
+        """A Debian `python3 -m venv` without ensurepip leaves bin/python
+        but no pip: re-running must install pip, not skip to `-m pip`."""
+        isfile = files("/p/daemon/requirements.txt",
+                       "/p/daemon/download_weights.py", "/i/.venv/bin/python")
+        p = self.plan(uv=None, system_python=None, isfile=isfile)
+        self.assertTrue(p["venv"].skipped)
+        self.assertEqual(p["pip"].argv, ["/i/.venv/bin/python", "-m",
+                                         "ensurepip", "--upgrade",
+                                         "--default-pip"])
+        self.assertIn("python3-venv", p["pip"].hint)
+        keys = [s.key for s in bk.build_install_plan(
+            "/i", "/p/daemon", "linux", uv=None, gpu=None, hf_token="t",
+            isfile=isfile)]
+        self.assertLess(keys.index("pip"), keys.index("torch"))
+        # with pip present, or with uv (no pip needed), no extra step
+        self.assertNotIn("pip", self.plan(uv=None, isfile=files(
+            "/p/daemon/requirements.txt", "/p/daemon/download_weights.py",
+            "/i/.venv/bin/python", "/i/.venv/bin/pip")))
+        self.assertNotIn("pip", self.plan(isfile=isfile))
+
+    def test_pip_plan_recreates_venv_whose_python_vanished(self):
+        """Distro upgraded python3.13 -> 3.14: .venv/bin/python dangles and
+        plain `-m venv` would leave it dangling."""
+        isfile = files("/p/daemon/requirements.txt",
+                       "/p/daemon/download_weights.py", "/i/.venv/pyvenv.cfg")
+        p = self.plan(uv=None, system_python=["/usr/bin/python3"],
+                      isfile=isfile)
+        self.assertEqual(p["venv"].argv, ["/usr/bin/python3", "-m", "venv",
+                                          "--clear", "/i/.venv"])
+        inst = bk.resolve_install("/i", "", "/p/daemon", "linux", isfile)
+        self.assertFalse(inst.ok)
+        self.assertIn("roto", inst.problem())
+        # uv's `venv --allow-existing` repairs it by itself
+        self.assertNotIn("--clear", self.plan(isfile=isfile)["venv"].argv)
+
+    def test_existing_venv_needs_no_system_python(self):
+        isfile = files("/p/daemon/requirements.txt",
+                       "/p/daemon/download_weights.py", "/i/.venv/bin/python",
+                       "/i/.venv/bin/pip")
+        p = self.plan(uv=None, system_python=None, isfile=isfile)
+        self.assertTrue(p["venv"].skipped)
+
+    def test_plan_error_explains_why_no_python(self):
+        with self.assertRaises(bk.PlanError) as cm:
+            self.plan(uv=None, system_python=None,
+                      python_problem="/usr/bin/python3 (Python 3.14) no trae "
+                                     "ensurepip")
+        self.assertIn("no trae ensurepip", str(cm.exception))
+        self.assertIn("python3-venv", str(cm.exception))
+
     def test_windows_python_skips_store_stub(self):
         def which(name, path=None):
             return {"python.exe": "C:\\Users\\u\\AppData\\Local\\Microsoft\\"
                                   "WindowsApps\\python.exe"}.get(name)
         self.assertIsNone(bk.find_system_python({}, "win32", which, files()))
+
+    def test_torch_cpu_without_nvidia(self):
+        url, label = bk.torch_variant("linux", None)
+        self.assertEqual(url, "https://download.pytorch.org/whl/cpu")
+        self.assertIn("CPU", label)
+
+    def test_detect_nvidia_gpu_absent_or_broken_driver_means_cpu(self):
+        self.assertIsNone(bk.detect_nvidia_gpu(
+            {}, "linux", which=lambda n, path=None: None))
+
+        class Proc:
+            returncode, stdout = 9, "NVIDIA-SMI has failed"
+        self.assertIsNone(bk.detect_nvidia_gpu(
+            {}, "linux", which=lambda n, path=None: "/usr/bin/nvidia-smi",
+            run=lambda *a, **k: Proc()))
 
     def test_parse_nvidia_smi_and_torch_variant(self):
         gpu = bk.parse_nvidia_smi("NVIDIA GeForce RTX 3090, 8.6\n")
@@ -342,6 +443,155 @@ class InstallPlanTest(unittest.TestCase):
         url, label = bk.torch_variant("linux", gpu)
         self.assertTrue(url.endswith("/cu128"))
         self.assertIn("12.8", label)
+
+
+class FakeRun:
+    """subprocess.run stand-in answering PYTHON_PROBE_CODE per interpreter:
+    {path: "3.12 1"} (version, ensurepip) or an exception to raise."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv[0])
+        answer = self.answers[argv[0]]
+        if isinstance(answer, Exception):
+            raise answer
+
+        class Proc:
+            returncode = 0
+            stdout = answer + "\n"
+        return Proc()
+
+
+class SystemPythonTest(unittest.TestCase):
+    """No uv: which interpreter builds the venv (Linux)."""
+
+    def which_from(self, table):
+        return lambda name, path=None: table.get(name)
+
+    def test_debian_python3_without_ensurepip_falls_back_to_versioned(self):
+        run = FakeRun({"/usr/bin/python3": "3.14 0",
+                       "/usr/bin/python3.12": "3.12 1"})
+        which = self.which_from({"python3": "/usr/bin/python3",
+                                 "python3.12": "/usr/bin/python3.12"})
+        argv, problem = bk.pick_system_python({}, "linux", which, files(),
+                                              run=run)
+        self.assertEqual(argv, ["/usr/bin/python3.12"])
+        self.assertEqual(problem, "")
+
+    def test_no_usable_python_explains_each_candidate(self):
+        run = FakeRun({"/usr/bin/python3": "3.14 0",
+                       "/usr/bin/python3.8": "3.8 1"})
+        which = self.which_from({"python3": "/usr/bin/python3"})
+        argv, problem = bk.pick_system_python(
+            {}, "linux", which, files("/usr/bin/python3"), run=run)
+        self.assertIsNone(argv)
+        self.assertIn("python3.14-venv", problem)
+        self.assertEqual(run.calls, ["/usr/bin/python3"])  # probed once
+        # Ubuntu 20.04: python3 is 3.8
+        run = FakeRun({"/usr/bin/python3": "3.8 1"})
+        argv, problem = bk.pick_system_python({}, "linux", which, files(),
+                                              run=run)
+        self.assertIsNone(argv)
+        self.assertIn("3.8", problem)
+        self.assertIn("3.10", problem)
+
+    def test_probe_errors_are_reported_not_raised(self):
+        run = FakeRun({"/usr/bin/python3": OSError("Exec format error")})
+        which = self.which_from({"python3": "/usr/bin/python3"})
+        argv, problem = bk.pick_system_python({}, "linux", which, files(),
+                                              run=run)
+        self.assertIsNone(argv)
+        self.assertIn("Exec format error", problem)
+        self.assertEqual(bk.check_venv_python(["/x"], FakeRun({"/x": ""}))[1],
+                         "/x: no responde como Python")
+
+    def test_krita_bundle_python_is_never_probed(self):
+        run = FakeRun({"/usr/bin/python3": "3.13 1"})
+        which = self.which_from({"python3": "/tmp/.mount_k/usr/bin/python3"})
+        argv, _ = bk.pick_system_python({}, "linux", which,
+                                        files("/usr/bin/python3"),
+                                        ["/tmp/.mount_k"], run)
+        self.assertEqual(argv, ["/usr/bin/python3"])
+        self.assertEqual(run.calls, ["/usr/bin/python3"])
+
+    def test_probe_code_really_detects_ensurepip(self):
+        """The probe snippet itself, run by this interpreter."""
+        import subprocess
+        version, problem = bk.check_venv_python([sys.executable],
+                                                subprocess.run)
+        self.assertEqual(version, sys.version_info[:2])
+        try:
+            import ensurepip  # noqa: F401
+            self.assertEqual(problem, "")
+        except ImportError:  # e.g. Debian/Ubuntu without python3-venv
+            self.assertIn("ensurepip", problem)
+
+
+class LinuxEnvTest(unittest.TestCase):
+    def test_hf_token_outside_flatpak_sandbox_is_found(self):
+        """Flatpak remaps XDG_CACHE_HOME into ~/.var/app/...; the login was
+        made outside, in ~/.cache/huggingface/token."""
+        env = {"HOME": "/h", "FLATPAK_ID": "org.kde.krita",
+               "XDG_CACHE_HOME": "/h/.var/app/org.kde.krita/cache"}
+        self.assertEqual(bk.hf_token_paths(env), [
+            "/h/.var/app/org.kde.krita/cache/huggingface/token",
+            "/h/.cache/huggingface/token"])
+        read = {"/h/.cache/huggingface/token": "hf_out\n"}
+
+        def reader(path):
+            if path in read:
+                return read[path]
+            raise OSError(path)
+        self.assertEqual(bk.find_hf_token("", env, reader)[0], "hf_out")
+
+    def test_hf_home_token_location(self):
+        env = {"HOME": "/h", "HF_HOME": "~/hf"}
+        self.assertEqual(bk.hf_token_paths(env)[0], "/h/hf/token")
+        env = {"HOME": "/h", "HF_TOKEN_PATH": "/t/tok", "HF_HOME": "/hf"}
+        self.assertEqual(bk.hf_token_paths(env)[:2], ["/t/tok", "/hf/token"])
+
+    def test_flatpak_and_amd_notes(self):
+        none = files()
+        self.assertEqual(bk.install_notes("linux", {}, None, none), [])
+        flat = bk.install_notes("linux", {"FLATPAK_ID": "org.kde.krita"},
+                                None, none)
+        self.assertEqual([t for t, _ in flat], ["Krita Flatpak"])
+        self.assertIn("flatpak-spawn", flat[0][1])
+        self.assertTrue(bk.is_flatpak({}, files("/.flatpak-info")))
+        amd = bk.install_notes("linux", {}, None, files("/dev/kfd"))
+        self.assertEqual([t for t, _ in amd], ["GPU AMD"])
+        # with an NVIDIA GPU (CUDA wheels) or off Linux: nothing to say
+        self.assertEqual(bk.install_notes("linux", {}, {"name": "RTX"},
+                                          files("/dev/kfd")), [])
+        self.assertEqual(bk.install_notes(
+            "darwin", {"FLATPAK_ID": "x"}, None, files("/dev/kfd")), [])
+
+    def test_xdg_data_home_for_install_and_ai_diffusion(self):
+        env = {"HOME": "/h", "XDG_DATA_HOME": "/h/.var/app/org.kde.krita/data"}
+        self.assertEqual(bk.default_data_dir("linux", env),
+                         "/h/.var/app/org.kde.krita/data/krita-autoselect")
+        self.assertEqual(
+            bk.ai_diffusion_settings_path("linux", env),
+            "/h/.var/app/org.kde.krita/data/krita/ai_diffusion/settings.json")
+
+    def test_appimage_env_is_stripped(self):
+        """What Krita's AppImage puts in the environment (AppRun +
+        pykrita): nothing of it may reach the venv's Python."""
+        env = {"APPDIR": "/tmp/.mount_kritaX",
+               "APPIMAGE": "/home/u/Applications/krita.AppImage",
+               "PYTHONPATH": "/tmp/.mount_kritaX/usr/lib/krita-python-libs",
+               "LD_LIBRARY_PATH":
+                   "/tmp/.mount_kritaX/usr/lib/libstdcpp-fallback/:",
+               "QT_PLUGIN_PATH": "/tmp/.mount_kritaX/usr/plugins",
+               "PATH": "/usr/local/bin:/usr/bin", "HOME": "/home/u"}
+        prefixes = bk.krita_prefixes(env, "/usr/bin/python3")
+        out = bk.sanitize_env(env, prefixes)
+        for var in ("PYTHONPATH", "LD_LIBRARY_PATH", "QT_PLUGIN_PATH"):
+            self.assertNotIn(var, out)
+        self.assertEqual(out["PATH"], "/usr/local/bin:/usr/bin")
 
 
 class LogTest(unittest.TestCase):

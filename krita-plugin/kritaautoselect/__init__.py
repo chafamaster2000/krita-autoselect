@@ -220,19 +220,26 @@ def _build_plan(cfg):
     prefixes = bk.krita_prefixes()
     env = bk.sanitize_env(os.environ, prefixes)
     uv = bk.find_uv(env, prefixes=prefixes)
-    system_python = None if uv else bk.find_system_python(env, prefixes=prefixes)
+    # Sin uv: un python3 que pueda crear el venv (≥3.10 y con ensurepip).
+    system_python, python_problem = (None, "") if uv else \
+        bk.pick_system_python(env, prefixes=prefixes)
     gpu = bk.detect_nvidia_gpu(env, prefixes=prefixes)
     token, source = bk.find_hf_token(cfg.hf_token)
     mac_cpu = bk.macos_cpu() if bk.platform_id() == "macos" else None
     steps = bk.build_install_plan(
         cfg.install_dir, BUNDLED_DIR, uv=uv, system_python=system_python,
         gpu=gpu, weights_setting=cfg.weights_setting, hf_token=token,
-        hf_token_from_setting=bool(cfg.hf_token), mac_cpu=mac_cpu)
-    info = (f"carpeta {cfg.install_dir} · "
-            f"{'uv ' + uv if uv else 'python ' + ' '.join(system_python)} · "
+        hf_token_from_setting=bool(cfg.hf_token), mac_cpu=mac_cpu,
+        python_problem=python_problem)
+    tool = ("uv " + uv if uv else
+            "python " + " ".join(system_python) if system_python else
+            "venv existente")
+    info = (f"carpeta {cfg.install_dir} · {tool} · "
             f"GPU {gpu['name'] if gpu else 'ninguna NVIDIA'} · "
             f"token HF: {source or 'no hace falta'}")
-    return [bk.Step("info", "Detectado", skip_reason=info)] + steps
+    notes = [bk.Step("note", title, skip_reason=text)
+             for title, text in bk.install_notes(gpu=gpu)]
+    return [bk.Step("info", "Detectado", skip_reason=info)] + notes + steps
 
 
 class DaemonClient(QObject):
@@ -266,9 +273,8 @@ class DaemonClient(QObject):
                                      f"{raw[:120]}"}
             except (OSError, http.client.HTTPException) as e:
                 # Conexión caída (p.ej. el daemon murió en medio del pedido):
-                # el docker reintenta una vez tras el reinicio.
-                data = {"error": f"Sin conexión con el server ({e})",
-                        "_conn": True}
+                # el docker reintenta una vez tras el reinicio. Un timeout no.
+                data = bk.request_error(e, timeout)
             except Exception as e:
                 data = {"error": f"Error hablando con el server ({e})"}
             signal.emit(data if isinstance(data, dict) else {"error": "?"})
