@@ -28,6 +28,12 @@ REPO = os.environ.get("AUTOSELECT_MODEL", "facebook/sam3")
 CHUNK = 1024 * 1024
 MAX_ATTEMPTS = 60
 PROGRESS_EVERY_S = 5.0
+# Final .part -> file rename: on Windows an antivirus or the search indexer
+# briefly holds a freshly written file open and the rename fails with
+# PermissionError (WinError 5/32). Retry for ~10 s instead of failing the
+# install at the very end of a 3.4 GB download.
+REPLACE_ATTEMPTS = 20
+REPLACE_DELAY_S = 0.5
 # Original-format checkpoint, redundant with model.safetensors (~3.4 GB saved).
 SKIP_FILES = {"sam3.pt"}
 
@@ -51,6 +57,17 @@ def _resolve_cdn_url(client, url, headers):
 
 def _fmt(n):
     return f"{n / 1024 ** 3:.2f} GB" if n >= 1024 ** 3 else f"{n / 1024 ** 2:.1f} MB"
+
+
+def _replace(src, dst):
+    for attempt in range(1, REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS:
+                raise
+            time.sleep(REPLACE_DELAY_S)
 
 
 def download_file(client, url, headers, dest, expected_size=None):
@@ -99,7 +116,7 @@ def download_file(client, url, headers, dest, expected_size=None):
     if expected_size is not None and os.path.getsize(tmp) != expected_size:
         raise RuntimeError(f"{dest}: got {os.path.getsize(tmp)} bytes, "
                            f"expected {expected_size}")
-    os.replace(tmp, dest)
+    _replace(tmp, dest)
 
 
 def list_files(repo):

@@ -331,11 +331,15 @@ class DaemonManager:
             kwargs = {}
             if IS_WINDOWS:
                 kwargs["creationflags"] = CREATE_NO_WINDOW
+            # cwd fuera de daemon/ del plugin: en Windows la carpeta que es
+            # el cwd de un proceso no se puede borrar, y el importador de
+            # plugins de Krita hace rmtree(pykrita/kritaautoselect) — con el
+            # daemon corriendo fallaba a la mitad y dejaba el plugin sin sus
+            # .py. server.py importa engine por sys.path[0], no por el cwd.
             return self._popen(
                 [install.python, "-u", install.server_script],
                 stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
-                env=env, cwd=os.path.dirname(install.server_script),
-                **kwargs)
+                env=env, cwd=cfg.data_dir, **kwargs)
         finally:
             log.close()  # el hijo tiene su propio descriptor
 

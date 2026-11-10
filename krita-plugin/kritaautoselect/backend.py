@@ -72,8 +72,14 @@ def platform_id(platform=None):
     return "linux"
 
 
-def _home(environ):
-    return (environ.get("HOME") or environ.get("USERPROFILE")
+def _home(environ, platform=None):
+    # En Windows manda USERPROFILE, como en os.path.expanduser (que desde
+    # Python 3.8 ignora HOME) y por lo tanto en huggingface_hub y el
+    # instalador de uv: Git Bash, MSYS2 o Cygwin dejan HOME en otro lado.
+    first, second = "HOME", "USERPROFILE"
+    if platform_id(platform) == "windows":
+        first, second = second, first
+    return (environ.get(first) or environ.get(second)
             or os.path.expanduser("~"))
 
 
@@ -90,7 +96,7 @@ def default_data_dir(platform=None, environ=None):
     """Carpeta por usuario donde el plugin instala el backend y deja logs."""
     plat = platform_id(platform)
     environ = os.environ if environ is None else environ
-    home = _home(environ)
+    home = _home(environ, plat)
     if plat == "windows":
         base = environ.get("LOCALAPPDATA") or _join(plat, home, "AppData", "Local")
     elif plat == "macos":
@@ -436,7 +442,7 @@ def ai_diffusion_settings_path(platform=None, environ=None):
     """settings.json de Krita AI Diffusion (para leer su URL de ComfyUI)."""
     plat = platform_id(platform)
     environ = os.environ if environ is None else environ
-    home = _home(environ)
+    home = _home(environ, plat)
     if plat == "windows":
         base = environ.get("APPDATA") or _join(plat, home, "AppData", "Roaming")
         return _join(plat, base, "krita", "ai_diffusion", "settings.json")
@@ -509,7 +515,7 @@ def pick_comfyui_url(candidates, probe=probe_comfyui):
 # Hugging Face
 # ----------------------------------------------------------------------------
 
-def hf_token_paths(environ=None):
+def hf_token_paths(environ=None, platform=None):
     environ = os.environ if environ is None else environ
     paths = []
     if environ.get("HF_TOKEN_PATH"):
@@ -517,12 +523,12 @@ def hf_token_paths(environ=None):
     if environ.get("HF_HOME"):
         paths.append(os.path.join(environ["HF_HOME"], "token"))
     cache = environ.get("XDG_CACHE_HOME") or os.path.join(
-        _home(environ), ".cache")
+        _home(environ, platform), ".cache")
     paths.append(os.path.join(cache, "huggingface", "token"))
     return paths
 
 
-def find_hf_token(setting, environ=None, read=None):
+def find_hf_token(setting, environ=None, read=None, platform=None):
     """(token, origen) — setting del plugin, variable de entorno o el login
     de `hf auth login`. (None, None) si no hay ninguno."""
     environ = os.environ if environ is None else environ
@@ -537,7 +543,7 @@ def find_hf_token(setting, environ=None, read=None):
             return f.read()
 
     read = read or _read
-    for path in hf_token_paths(environ):
+    for path in hf_token_paths(environ, platform):
         try:
             token = read(path).strip()
         except OSError:
@@ -590,7 +596,7 @@ def find_uv(environ=None, platform=None, which=shutil.which,
     found = _which(exe, environ, prefixes, which)
     if found:
         return found
-    home = _home(environ)
+    home = _home(environ, plat)
     candidates = [_join(plat, home, ".local", "bin", exe),
                   _join(plat, home, ".cargo", "bin", exe)]
     if plat == "windows" and environ.get("LOCALAPPDATA"):
@@ -648,16 +654,19 @@ def parse_nvidia_smi(output):
 
 
 def detect_nvidia_gpu(environ=None, platform=None, which=shutil.which,
-                      run=subprocess.run, prefixes=()):
+                      run=subprocess.run, prefixes=(), isfile=os.path.isfile):
     """Info de la GPU NVIDIA, o None si no hay (o no hay driver)."""
     environ = os.environ if environ is None else environ
     plat = platform_id(platform)
     exe = "nvidia-smi.exe" if plat == "windows" else "nvidia-smi"
     smi = _which(exe, environ, prefixes, which)
     if not smi and plat == "windows":
-        candidate = os.path.join(environ.get("SystemRoot", r"C:\Windows"),
-                                 "System32", exe)
-        smi = candidate if os.path.isfile(candidate) else None
+        # Una copia de os.environ (sanitize_env) tiene las claves en
+        # mayúsculas en Windows: "SystemRoot" llega como "SYSTEMROOT".
+        root = (environ.get("SYSTEMROOT") or environ.get("SystemRoot")
+                or r"C:\Windows")
+        candidate = os.path.join(root, "System32", exe)
+        smi = candidate if isfile(candidate) else None
     if not smi:
         return None
     flags = 0x08000000 if plat == "windows" else 0  # CREATE_NO_WINDOW

@@ -96,10 +96,14 @@ class Sam3Engine:
         if not smi:
             return None
         try:
+            # stdin=DEVNULL: our stdin is the parent-watch pipe, with a
+            # thread blocked reading it. On Windows that pending synchronous
+            # ReadFile locks the pipe's file object, so a child inheriting it
+            # stalls in its CRT startup (GetFileType) until the 10 s timeout.
             out = subprocess.run(
                 [smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10,
-                creationflags=0x08000000 if os.name == "nt" else 0)
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=10, creationflags=0x08000000 if os.name == "nt" else 0)
             return int(out.stdout.split()[0]) * 1024 ** 2
         except Exception:
             return None

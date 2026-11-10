@@ -34,6 +34,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_PORT = 5679
+IS_WINDOWS = os.name == "nt"
 MAX_BODY_BYTES = 96 * 1024 * 1024
 AUTH_TOKEN = os.environ.get("AUTOSELECT_TOKEN", "")
 
@@ -156,8 +157,19 @@ class AutoselectHandler(BaseHTTPRequestHandler):
         self._reply({"status": "ok", **result})
 
 
+class _Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # http.server sets SO_REUSEADDR. On Windows that option lets a second
+        # socket bind a port that is still LISTENING, so a second daemon (an
+        # orphan, run_daemon.ps1, another Krita) would silently share 5679
+        # instead of failing with "address in use". Windows doesn't need it
+        # for TIME_WAIT either (asyncio, tornado and twisted skip it there).
+        self.allow_reuse_address = not IS_WINDOWS
+        super().server_bind()
+
+
 def make_server(engine, port=DEFAULT_PORT, host="127.0.0.1"):
-    server = ThreadingHTTPServer((host, port), AutoselectHandler)
+    server = _Server((host, port), AutoselectHandler)
     server.engine = engine
     return server
 
