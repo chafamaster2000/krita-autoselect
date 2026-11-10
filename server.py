@@ -22,10 +22,15 @@ Env:
   AUTOSELECT_COMFYUI_URL     ComfyUI to ask for VRAM before loading
                              (default http://127.0.0.1:8001; empty disables)
   AUTOSELECT_TOKEN           optional shared token (X-Autoselect-Token)
+  AUTOSELECT_PARENT_WATCH    "stdin": exit when stdin reaches EOF — set by a
+                             parent (the Krita plugin) that keeps the pipe
+                             open, so the daemon dies with it even on a crash
   HF_TOKEN                   standard Hugging Face auth for gated weights
 """
 import json
 import os
+import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_PORT = 5679
@@ -144,6 +149,8 @@ class AutoselectHandler(BaseHTTPRequestHandler):
         try:
             result = self.server.engine.segment(**kwargs)
         except Exception as e:
+            print(f"[autoselect] segment failed: {type(e).__name__}: {e}",
+                  flush=True)
             self._reply({"error": str(e)}, 500)
             return
         self._reply({"status": "ok", **result})
@@ -153,6 +160,18 @@ def make_server(engine, port=DEFAULT_PORT, host="127.0.0.1"):
     server = ThreadingHTTPServer((host, port), AutoselectHandler)
     server.engine = engine
     return server
+
+
+def _exit_on_stdin_eof():
+    """Parent watch: the parent holds our stdin open and never writes. When
+    it exits (cleanly or not) the OS closes the pipe and we get EOF."""
+    try:
+        while os.read(sys.stdin.fileno(), 4096):
+            pass
+    except OSError:
+        pass
+    print("[autoselect] parent closed stdin — exiting", flush=True)
+    os._exit(0)
 
 
 def main():
@@ -168,7 +187,14 @@ def main():
                                    "http://127.0.0.1:8001"),
     )
     port = int(os.environ.get("AUTOSELECT_PORT", DEFAULT_PORT))
-    server = make_server(engine, port)
+    if os.environ.get("AUTOSELECT_PARENT_WATCH") == "stdin":
+        threading.Thread(target=_exit_on_stdin_eof, daemon=True).start()
+    try:
+        server = make_server(engine, port)
+    except OSError as e:
+        print(f"[autoselect] error: cannot listen on 127.0.0.1:{port}: {e} "
+              f"(address already in use? set AUTOSELECT_PORT)", flush=True)
+        sys.exit(3)
     print(f"[autoselect] listening on http://127.0.0.1:{port} "
           f"(model loads on first request)")
     try:

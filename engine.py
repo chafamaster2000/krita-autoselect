@@ -9,6 +9,7 @@ keeps the HTTP layer testable without ML installed.
 import base64
 import io
 import json
+import os
 import threading
 import time
 import urllib.request
@@ -54,6 +55,7 @@ class Sam3Engine:
         self._resolved_device = None
         self._last_used = 0.0
         self._watchdog_started = False
+        self._loading = None            # "detector" | "tracker" while loading
 
     # ----- lifecycle -----
 
@@ -61,6 +63,7 @@ class Sam3Engine:
         return {
             "model": self.model_id,
             "loaded": self._model is not None,
+            "loading": self._loading is not None,
             "tracker_loaded": self._tracker is not None,
             "device": self._resolved_device,
             "unload_after_s": self.unload_after_s,
@@ -81,15 +84,52 @@ class Sam3Engine:
         except Exception as e:
             print(f"[autoselect] ComfyUI free failed (continuing): {e}")
 
+    @staticmethod
+    def _free_vram_nvidia_smi():
+        """Free VRAM in bytes WITHOUT creating a CUDA context (None if
+        nvidia-smi is unavailable). When another process (ComfyUI) holds
+        almost all VRAM, even torch's context creation inside
+        mem_get_info() fails with OOM — so measure from outside first."""
+        import shutil
+        import subprocess
+        smi = shutil.which("nvidia-smi")
+        if not smi:
+            return None
+        try:
+            out = subprocess.run(
+                [smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=0x08000000 if os.name == "nt" else 0)
+            return int(out.stdout.split()[0]) * 1024 ** 2
+        except Exception:
+            return None
+
     def _ensure_vram(self, torch, device):
         if not device.startswith("cuda"):
             return
-        free, _total = torch.cuda.mem_get_info()
+        free = self._free_vram_nvidia_smi()
+        if free is None:
+            try:
+                free, _total = torch.cuda.mem_get_info()
+            except Exception as e:  # no room even for a CUDA context
+                print(f"[autoselect] cannot query VRAM ({e})")
+                free = 0
         if free < VRAM_NEEDED_BYTES:
+            print(f"[autoselect] only {free / 1024 ** 3:.1f} GB VRAM free")
             self._free_comfyui_vram()
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def _load_locked(self):
+        self._loading = "detector"
+        try:
+            self._load_detector_locked()
+        finally:
+            self._loading = None
+
+    def _load_detector_locked(self):
         import torch
         from transformers import Sam3Model, Sam3Processor
 
@@ -127,6 +167,13 @@ class Sam3Engine:
             threading.Thread(target=self._watchdog_loop, daemon=True).start()
 
     def _load_tracker_locked(self):
+        self._loading = "tracker"
+        try:
+            self._load_tracker_model_locked()
+        finally:
+            self._loading = None
+
+    def _load_tracker_model_locked(self):
         """Load the PVS head (Sam3Tracker): click/box → the exact object.
 
         Same checkpoint as the detector; loaded independently and only when a

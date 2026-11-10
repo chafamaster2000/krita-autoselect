@@ -1,7 +1,12 @@
 """AI Select — selección por segmentación (SAM 3) dentro de Krita.
 
 Docker estilo krita-ai-diffusion que habla con el daemon krita-autoselect
-(HTTP local, puerto 5679). Dos formas de seleccionar:
+(HTTP local, puerto 5679). El plugin es autónomo: trae el código del daemon
+(carpeta daemon/), lo instala si hace falta (venv + torch + pesos) y lo
+arranca/supervisa/para solo — como el "managed server" de AI Diffusion.
+Ver backend.py (lógica pura) y manager.py (procesos e hilos).
+
+Dos formas de seleccionar:
 
 - Prompt de texto ("the red car") → todas las instancias del concepto.
 - Modo click (botón lazo) → click sobre el canvas selecciona el objeto
@@ -26,14 +31,14 @@ if _USE_QT6:
     try:
         from PyQt6.QtCore import (
             QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QPointF,
-            QRect, QSize, Qt, QTimer, pyqtSignal,
+            QRect, QSize, Qt, QTimer, QUrl, pyqtSignal,
         )
-        from PyQt6.QtGui import QColor, QImage, QPalette
+        from PyQt6.QtGui import QColor, QDesktopServices, QImage, QPalette
         from PyQt6.QtWidgets import (
-            QAbstractScrollArea, QApplication, QCheckBox, QComboBox,
-            QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-            QPlainTextEdit, QPushButton, QRubberBand, QSpinBox, QToolButton,
-            QVBoxLayout, QWidget,
+            QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDialog,
+            QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
+            QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+            QRubberBand, QSpinBox, QToolButton, QVBoxLayout, QWidget,
         )
         # Qt6 movió QOpenGLWidget de QtWidgets a su propio módulo.
         from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -42,25 +47,33 @@ if _USE_QT6:
 if not _USE_QT6:
     from PyQt5.QtCore import (  # noqa: F811
         QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QPointF,
-        QRect, QSize, Qt, QTimer, pyqtSignal,
+        QRect, QSize, Qt, QTimer, QUrl, pyqtSignal,
     )
-    from PyQt5.QtGui import QColor, QImage, QPalette  # noqa: F811
+    from PyQt5.QtGui import (  # noqa: F811
+        QColor, QDesktopServices, QImage, QPalette,
+    )
     from PyQt5.QtWidgets import (  # noqa: F811
-        QAbstractScrollArea, QApplication, QCheckBox, QComboBox,
-        QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-        QOpenGLWidget, QPlainTextEdit, QPushButton, QRubberBand, QSpinBox,
-        QToolButton, QVBoxLayout, QWidget,
+        QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDialog,
+        QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
+        QHBoxLayout, QLabel, QLineEdit, QOpenGLWidget, QPlainTextEdit,
+        QPushButton, QRubberBand, QSpinBox, QToolButton, QVBoxLayout, QWidget,
     )
 
+import atexit
 import base64
 import http.client
 import json
 import os
-import subprocess
 import threading
 
+from . import backend as bk
+from .manager import Config, DaemonManager, InstallRunner
+
 SETTINGS_GROUP = "kritaautoselect"
-DEFAULT_URL = "http://127.0.0.1:5679"
+DEFAULT_URL = bk.DEFAULT_URL
+# Copia del daemon que trae el plugin (la genera scripts/build_plugin.py).
+BUNDLED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "daemon")
 MODES = [("Reemplazar", "replace"), ("Agregar", "add"),
          ("Restar", "subtract"), ("Intersecar", "intersect")]
 # Herramienta inofensiva mientras el modo click está armado: aunque algún
@@ -119,11 +132,113 @@ def _write_setting(key, value):
     Krita.instance().writeSetting(SETTINGS_GROUP, key, str(value))
 
 
+def _read_bool(key, default):
+    value = _read_setting(key, "true" if default else "false")
+    return str(value).lower() in ("true", "1", "yes")
+
+
+def _read_int(key, default):
+    try:
+        return int(float(_read_setting(key, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _config_from_settings():
+    """Foto de la config (hilo de UI) para el manager, que la lee en hilos."""
+    install_dir = _read_setting("install_dir", "")
+    if not install_dir:  # setting viejo: carpeta del repo
+        install_dir = _read_setting("repo_path", "")
+    return Config(
+        url=_read_setting("server_url", DEFAULT_URL).strip() or DEFAULT_URL,
+        install_dir=install_dir.strip(),
+        weights_setting=_read_setting("weights_path", "").strip(),
+        hf_token=_read_setting("hf_token", "").strip(),
+        unload_after_s=_read_int("unload_after_s", bk.DEFAULT_UNLOAD_AFTER_S),
+        comfyui_url=_read_setting("comfyui_url", "").strip(),
+        comfyui_free=_read_bool("comfyui_free", True),
+        bundled_dir=BUNDLED_DIR,
+    )
+
+
+class _Hub(QObject):
+    """Señales compartidas por todos los dockers (una por ventana). Los
+    hilos del manager/instalador emiten acá; Qt las entrega en el hilo de UI."""
+
+    state = pyqtSignal(dict)
+    install_line = pyqtSignal(str)
+    install_step = pyqtSignal(str)
+    install_done = pyqtSignal(bool, str)
+
+
+_hub = None
+_manager = None
+_runner = None
+
+
+def _get_hub():
+    global _hub
+    if _hub is None:
+        _hub = _Hub()
+    return _hub
+
+
+def _get_manager():
+    global _manager
+    if _manager is None:
+        hub = _get_hub()
+        _manager = DaemonManager(_config_from_settings())
+        _manager.add_listener(hub.state.emit)
+    return _manager
+
+
+def _get_runner():
+    global _runner
+    if _runner is None:
+        hub = _get_hub()
+        _runner = InstallRunner(
+            on_line=hub.install_line.emit,
+            on_step=lambda i, step: hub.install_step.emit(step.title),
+            on_done=hub.install_done.emit)
+    return _runner
+
+
+def _shutdown():
+    """Al cerrar Krita: parar el daemon que arrancó el plugin y cualquier
+    instalación en curso. Un daemon ajeno no se toca."""
+    try:
+        if _runner is not None and _runner.running:
+            _runner.cancel()
+        if _manager is not None:
+            _manager.shutdown()
+    except Exception:
+        pass
+
+
+def _build_plan(cfg):
+    """Corre en el hilo del instalador (detectar GPU lanza nvidia-smi)."""
+    prefixes = bk.krita_prefixes()
+    env = bk.sanitize_env(os.environ, prefixes)
+    uv = bk.find_uv(env, prefixes=prefixes)
+    system_python = None if uv else bk.find_system_python(env, prefixes=prefixes)
+    gpu = bk.detect_nvidia_gpu(env, prefixes=prefixes)
+    token, source = bk.find_hf_token(cfg.hf_token)
+    steps = bk.build_install_plan(
+        cfg.install_dir, BUNDLED_DIR, uv=uv, system_python=system_python,
+        gpu=gpu, weights_setting=cfg.weights_setting, hf_token=token,
+        hf_token_from_setting=bool(cfg.hf_token))
+    info = (f"carpeta {cfg.install_dir} · "
+            f"{'uv ' + uv if uv else 'python ' + ' '.join(system_python)} · "
+            f"GPU {gpu['name'] if gpu else 'ninguna NVIDIA'} · "
+            f"token HF: {source or 'no hace falta'}")
+    return [bk.Step("info", "Detectado", skip_reason=info)] + steps
+
+
 class DaemonClient(QObject):
     """HTTP hacia el daemon en un thread; resultados por señal Qt (queued)."""
 
     finished = pyqtSignal(dict)   # respuesta de /segment (o {"error": ...})
-    health = pyqtSignal(dict)     # respuesta de /health
+    ready = pyqtSignal(bool, str)  # backend listo (o no) para un pedido
 
     @property
     def base(self):
@@ -141,19 +256,26 @@ class DaemonClient(QObject):
                 conn.request(method, path, body,
                              {"Content-Type": "application/json"})
                 resp = conn.getresponse()
-                data = json.loads(resp.read().decode())
+                raw = resp.read().decode()
                 conn.close()
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    data = {"error": f"Respuesta inválida del server: "
+                                     f"{raw[:120]}"}
+            except (OSError, http.client.HTTPException) as e:
+                # Conexión caída (p.ej. el daemon murió en medio del pedido):
+                # el docker reintenta una vez tras el reinicio.
+                data = {"error": f"Sin conexión con el server ({e})",
+                        "_conn": True}
             except Exception as e:
-                data = {"error": f"Sin conexión con el server ({e})"}
+                data = {"error": f"Error hablando con el server ({e})"}
             signal.emit(data if isinstance(data, dict) else {"error": "?"})
 
         threading.Thread(target=work, daemon=True).start()
 
     def segment(self, payload, timeout=300):
         self._request("POST", "/segment", payload, timeout, self.finished)
-
-    def check_health(self, timeout=3):
-        self._request("GET", "/health", None, timeout, self.health)
 
 
 class CanvasClickFilter(QObject):
@@ -274,15 +396,19 @@ class AutoSelectDocker(DockWidget):
         self._client = DaemonClient(self)
         self._client.finished.connect(self._on_segment_result,
                                       Qt.ConnectionType.QueuedConnection)
-        self._client.health.connect(self._on_health, Qt.ConnectionType.QueuedConnection)
+        self._client.ready.connect(self._on_backend_ready,
+                                   Qt.ConnectionType.QueuedConnection)
         self._click_filter = CanvasClickFilter(self)
         self._click_filter.clicked.connect(self._on_canvas_click,
                                            Qt.ConnectionType.QueuedConnection)
         self._click_filter.dragged.connect(self._on_canvas_drag,
                                            Qt.ConnectionType.QueuedConnection)
         self._filtered_widgets = []
-        self._server_process = None
         self._busy = False
+        self._pending = None      # payload esperando que el backend esté listo
+        self._retry_left = 0
+        self._installing = False
+        self._log_dialog = None
         self._previous_tool = None
         # Puntos acumulados del modo click (refinamiento estilo SAM).
         self._click_points = []
@@ -290,7 +416,21 @@ class AutoSelectDocker(DockWidget):
         self._build_ui()
         self._load_settings()
         _dockers.append(self)
-        QTimer.singleShot(1500, self._client.check_health)
+        hub = _get_hub()
+        hub.state.connect(self._on_backend_state)
+        hub.install_line.connect(self._on_install_line)
+        hub.install_step.connect(self._on_install_step)
+        hub.install_done.connect(self._on_install_done)
+        self._installing = _get_runner().running
+        self._update_install_buttons()
+        self._on_backend_state(_get_manager().snapshot())
+        # Refresco periódico del estado (rápido mientras hay un pedido, para
+        # mostrar "Cargando modelo"); el health corre en un hilo.
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._poll_backend)
+        self._poll.start(1000)
+        self._poll_ticks = 0
+        QTimer.singleShot(500, _get_manager().refresh)
 
     # ----- UI -----
 
@@ -300,15 +440,15 @@ class AutoSelectDocker(DockWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # Header: estado + engranaje (muestra/oculta la config del server)
+        # Header: estado del backend + engranaje (muestra/oculta la config)
         header = QHBoxLayout()
-        self._status = QLabel("...")
-        self._status.setWordWrap(True)
-        header.addWidget(self._status, 1)
+        self._backend_label = QLabel("Backend: comprobando…")
+        self._backend_label.setWordWrap(True)
+        header.addWidget(self._backend_label, 1)
         gear = QToolButton()
         gear.setIcon(Krita.instance().icon("configure"))
         gear.setAutoRaise(True)
-        gear.setToolTip("Configurar server")
+        gear.setToolTip("Configurar / instalar el backend")
         gear.clicked.connect(self._toggle_config)
         header.addWidget(gear)
         layout.addLayout(header)
@@ -362,41 +502,144 @@ class AutoSelectDocker(DockWidget):
         actions.addWidget(self._click_btn)
         layout.addLayout(actions)
 
-        # Config del server (oculta por defecto, estilo "Connection")
-        self._config = QGroupBox("Server de segmentación")
-        cfg = QVBoxLayout(self._config)
-        cfg.addWidget(QLabel("URL (existente o gestionado):"))
-        row = QHBoxLayout()
-        self._url_edit = QLineEdit(DEFAULT_URL)
-        self._url_edit.editingFinished.connect(self._save_settings)
-        row.addWidget(self._url_edit, 1)
-        test = QPushButton("Probar")
-        test.clicked.connect(self._client.check_health)
-        row.addWidget(test)
-        cfg.addLayout(row)
-        cfg.addWidget(QLabel("Carpeta del repo krita-autoselect (local):"))
-        self._repo_edit = QLineEdit()
-        self._repo_edit.setPlaceholderText("D:\\krita-autoselect")
-        self._repo_edit.editingFinished.connect(self._save_settings)
-        cfg.addWidget(self._repo_edit)
-        srv_row = QHBoxLayout()
-        self._start_btn = QPushButton("Iniciar server")
-        self._start_btn.clicked.connect(self._start_server)
-        srv_row.addWidget(self._start_btn)
-        self._stop_btn = QPushButton("Parar")
-        self._stop_btn.clicked.connect(self._stop_server)
-        srv_row.addWidget(self._stop_btn)
-        cfg.addLayout(srv_row)
-        hint = QLabel(
-            '<a href="https://github.com/chafamaster2000/krita-autoselect">'
-            "Instalación del server (README)</a>")
-        hint.setOpenExternalLinks(True)
-        cfg.addWidget(hint)
+        # Resultado de la última operación
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        layout.addWidget(self._status)
+
+        self._config = self._build_config()
         self._config.setVisible(False)
         layout.addWidget(self._config)
 
         layout.addStretch()
         self.setWidget(root)
+
+    def _build_config(self):
+        """Config del backend (oculta por defecto, estilo "Connection")."""
+        box = QGroupBox("Backend SAM 3")
+        cfg = QVBoxLayout(box)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        def path_row(edit, title):
+            row = QHBoxLayout()
+            row.addWidget(edit, 1)
+            browse = QToolButton()
+            browse.setText("…")
+            browse.clicked.connect(lambda: self._browse_dir(edit, title))
+            row.addWidget(browse)
+            return row
+
+        self._url_edit = QLineEdit(DEFAULT_URL)
+        self._url_edit.setToolTip(
+            "Si ya hay un daemon contestando en esta URL se usa ese; si no, "
+            "el plugin arranca el suyo en ese puerto.")
+        self._url_edit.editingFinished.connect(self._save_settings)
+        form.addRow("URL:", self._url_edit)
+
+        self._install_edit = QLineEdit()
+        self._install_edit.setPlaceholderText(bk.default_data_dir())
+        self._install_edit.setToolTip(
+            "Carpeta con el .venv del backend. Puede ser una instalación "
+            "existente (p.ej. el repo krita-autoselect) o vacía = la carpeta "
+            "por defecto donde instala «Instalar backend».")
+        self._install_edit.editingFinished.connect(self._save_settings)
+        form.addRow("Instalación:", path_row(self._install_edit,
+                                             "Carpeta de instalación"))
+
+        self._weights_edit = QLineEdit()
+        self._weights_edit.setPlaceholderText(
+            "auto: <instalación>/models/sam3 o Hugging Face")
+        self._weights_edit.setToolTip(
+            "Carpeta con los pesos de SAM 3 en formato Hugging Face "
+            "(config.json + model.safetensors).")
+        self._weights_edit.editingFinished.connect(self._save_settings)
+        form.addRow("Pesos:", path_row(self._weights_edit,
+                                       "Carpeta de pesos SAM 3"))
+
+        self._token_edit = QLineEdit()
+        self._token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._token_edit.setPlaceholderText("vacío = login de `hf auth login`")
+        self._token_edit.setToolTip(
+            "Token de Hugging Face para bajar facebook/sam3 (repo con "
+            "licencia: aceptala en huggingface.co/facebook/sam3). Se guarda "
+            "en la configuración de Krita (kritarc).")
+        self._token_edit.editingFinished.connect(self._save_settings)
+        form.addRow("Token HF:", self._token_edit)
+
+        self._unload_spin = QSpinBox()
+        self._unload_spin.setRange(0, 24 * 3600)
+        self._unload_spin.setSingleStep(60)
+        self._unload_spin.setSuffix(" s")
+        self._unload_spin.setSpecialValueText("nunca")
+        self._unload_spin.setToolTip(
+            "Segundos sin uso hasta liberar la VRAM (0 = modelo siempre "
+            "cargado).")
+        self._unload_spin.editingFinished.connect(self._save_settings)
+        form.addRow("Liberar VRAM tras:", self._unload_spin)
+
+        comfy_row = QHBoxLayout()
+        self._comfy_check = QCheckBox()
+        self._comfy_check.setToolTip(
+            "Antes de cargar SAM 3, si falta VRAM, pedirle a ComfyUI que "
+            "descargue sus modelos.")
+        self._comfy_check.toggled.connect(self._save_settings)
+        comfy_row.addWidget(self._comfy_check)
+        self._comfy_edit = QLineEdit()
+        self._comfy_edit.setPlaceholderText("auto (AI Diffusion / 8188 / 8001)")
+        self._comfy_edit.editingFinished.connect(self._save_settings)
+        comfy_row.addWidget(self._comfy_edit, 1)
+        form.addRow("ComfyUI:", comfy_row)
+
+        self._autostart_check = QCheckBox("Iniciar el backend al abrir Krita")
+        self._autostart_check.toggled.connect(self._save_settings)
+        form.addRow("", self._autostart_check)
+        cfg.addLayout(form)
+
+        srv_row = QHBoxLayout()
+        for text, slot in (("Probar", lambda: _get_manager().refresh()),
+                           ("Iniciar", self._start_server),
+                           ("Parar", self._stop_server),
+                           ("Ver log", self._show_log)):
+            btn = QPushButton(text)
+            btn.clicked.connect(slot)
+            srv_row.addWidget(btn)
+        cfg.addLayout(srv_row)
+
+        inst_row = QHBoxLayout()
+        self._install_btn = QPushButton("Instalar backend")
+        self._install_btn.setToolTip(
+            "Crea el entorno Python, instala torch (CUDA si hay GPU NVIDIA) "
+            "y las dependencias, y baja los pesos de SAM 3 (~3.4 GB). Se "
+            "puede cancelar y volver a correr: retoma donde quedó.")
+        self._install_btn.clicked.connect(self._install_backend)
+        inst_row.addWidget(self._install_btn, 1)
+        self._cancel_btn = QPushButton("Cancelar")
+        self._cancel_btn.clicked.connect(lambda: _get_runner().cancel())
+        inst_row.addWidget(self._cancel_btn)
+        cfg.addLayout(inst_row)
+
+        self._install_log = QPlainTextEdit()
+        self._install_log.setReadOnly(True)
+        self._install_log.setMaximumBlockCount(3000)
+        self._install_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._install_log.setMinimumHeight(140)
+        self._install_log.setVisible(False)
+        cfg.addWidget(self._install_log)
+
+        hint = QLabel(
+            '<a href="https://github.com/chafamaster2000/krita-autoselect">'
+            "Ayuda (README)</a>")
+        hint.setOpenExternalLinks(True)
+        cfg.addWidget(hint)
+        return box
+
+    def _browse_dir(self, edit, title):
+        path = QFileDialog.getExistingDirectory(self, title, edit.text())
+        if path:
+            edit.setText(path)
+            self._save_settings()
 
     def canvasChanged(self, canvas):
         # Si cambia la vista con el modo click armado, re-enganchar el filtro.
@@ -421,12 +664,32 @@ class AutoSelectDocker(DockWidget):
     # ----- settings -----
 
     def _load_settings(self):
-        self._url_edit.setText(_read_setting("server_url", DEFAULT_URL))
-        self._repo_edit.setText(_read_setting("repo_path", ""))
+        cfg = _config_from_settings()
+        self._url_edit.setText(cfg.url)
+        self._install_edit.setText(
+            _read_setting("install_dir", "") or _read_setting("repo_path", ""))
+        self._weights_edit.setText(cfg.weights_setting)
+        self._token_edit.setText(cfg.hf_token)
+        self._unload_spin.setValue(int(cfg.unload_after_s))
+        self._comfy_check.setChecked(cfg.comfyui_free)
+        self._comfy_edit.setText(cfg.comfyui_url)
+        self._autostart_check.setChecked(_read_bool("autostart", False))
 
-    def _save_settings(self):
-        _write_setting("server_url", self._url_edit.text().strip())
-        _write_setting("repo_path", self._repo_edit.text().strip())
+    def _save_settings(self, *_):
+        _write_setting("server_url", self._url_edit.text().strip()
+                       or DEFAULT_URL)
+        _write_setting("install_dir", self._install_edit.text().strip())
+        _write_setting("weights_path", self._weights_edit.text().strip())
+        _write_setting("hf_token", self._token_edit.text().strip())
+        _write_setting("unload_after_s", self._unload_spin.value())
+        _write_setting("comfyui_free",
+                       "true" if self._comfy_check.isChecked() else "false")
+        _write_setting("comfyui_url", self._comfy_edit.text().strip())
+        _write_setting("autostart",
+                       "true" if self._autostart_check.isChecked() else "false")
+        new = _config_from_settings()
+        if new.launch_key() != _get_manager().config.launch_key():
+            _get_manager().configure(new)
 
     def _toggle_config(self):
         self._config.setVisible(not self._config.isVisible())
@@ -437,48 +700,105 @@ class AutoSelectDocker(DockWidget):
         self._status.setText(
             f'<span style="color:{self._colors[color]};">{text}</span>')
 
-    def _on_health(self, data):
-        if data.get("status") == "ok":
-            loaded = data.get("loaded") or data.get("tracker_loaded")
-            detail = "modelo cargado" if loaded else "modelo en frío"
-            self._set_status(f"Conectado — {detail}", "green")
+    def _set_backend_text(self, text, color, tooltip=""):
+        self._backend_label.setText(
+            f'<span style="color:{self._colors[color]};">{text}</span>')
+        self._backend_label.setToolTip(tooltip)
+
+    def _poll_backend(self):
+        # 1 s mientras hay un pedido en vuelo; 10 s en reposo.
+        self._poll_ticks += 1
+        if self._busy or self._poll_ticks % 10 == 0:
+            _get_manager().refresh()
+
+    def _on_backend_state(self, snap):
+        if self._installing:
+            return  # el instalador escribe su propio estado
+        state = snap.get("state")
+        detail = snap.get("detail") or ""
+        tip = detail
+        if snap.get("pid"):
+            tip = (tip + "\n" if tip else "") + f"PID {snap['pid']}"
+        if state == DaemonManager.READY:
+            text = ("Listo — modelo cargado" if snap.get("loaded")
+                    else "Listo — modelo en frío (carga al seleccionar)")
+            if not snap.get("owned"):
+                text += " · daemon existente"
+            self._set_backend_text(text, "green", tip)
+        elif state == DaemonManager.LOADING:
+            self._set_backend_text(
+                "Cargando modelo SAM 3… (la primera vez tarda)", "yellow", tip)
+        elif state == DaemonManager.STARTING:
+            self._set_backend_text(detail or "Iniciando backend…", "yellow",
+                                   tip)
+        elif state == DaemonManager.STOPPED:
+            self._set_backend_text(f"Backend detenido — {detail}", "grey", tip)
+        elif state == DaemonManager.NOT_INSTALLED:
+            self._set_backend_text(
+                "Backend no instalado — engranaje → «Instalar backend» o "
+                "apuntá a una instalación", "red", tip)
+        elif state == DaemonManager.ERROR:
+            self._set_backend_text(f"Error del backend: {detail}", "red", tip)
         else:
-            self._set_status(
-                "Server no conectado (engranaje → Iniciar server)", "yellow")
+            self._set_backend_text("Backend: comprobando…", "grey", tip)
 
     # ----- server local -----
 
-    def _repo_path(self):
-        return self._repo_edit.text().strip() or "D:\\krita-autoselect"
-
     def _start_server(self):
-        if self._server_process and self._server_process.poll() is None:
-            self._set_status("El server ya está corriendo", "green")
-            return
-        repo = self._repo_path()
-        python = os.path.join(repo, ".venv", "Scripts", "python.exe")
-        server = os.path.join(repo, "server.py")
-        if not os.path.exists(python) or not os.path.exists(server):
-            self._set_status(
-                f"No encuentro el server en {repo} (ver README)", "red")
-            return
-        env = dict(os.environ)
-        weights = os.path.join(repo, "models", "sam3")
-        if os.path.isdir(weights):
-            env["AUTOSELECT_WEIGHTS_PATH"] = weights
-        flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-        self._server_process = subprocess.Popen(
-            [python, "-u", server], env=env, creationflags=flags,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self._set_status("Iniciando server...", "yellow")
-        QTimer.singleShot(2500, self._client.check_health)
+        _get_manager().start()
 
     def _stop_server(self):
-        if self._server_process and self._server_process.poll() is None:
-            self._server_process.terminate()
-            self._set_status("Server detenido", "grey")
+        if not _get_manager().stop():
+            self._set_status("No hay un backend iniciado por el plugin (un "
+                             "daemon existente no se toca)", "grey")
+
+    def _show_log(self):
+        if self._log_dialog is None:
+            self._log_dialog = LogDialog(self)
+        self._log_dialog.show_log(_get_manager().config)
+
+    # ----- instalador -----
+
+    def _update_install_buttons(self):
+        self._install_btn.setEnabled(not self._installing)
+        self._cancel_btn.setEnabled(self._installing)
+
+    def _install_backend(self):
+        runner = _get_runner()
+        if runner.running:
+            return
+        self._save_settings()
+        cfg = _config_from_settings()
+        _get_manager().stop()  # no instalar con el daemon propio corriendo
+        self._install_log.clear()
+        self._install_log.setVisible(True)
+        self._config.setVisible(True)
+        if runner.start(lambda: _build_plan(cfg), cfg.install_log):
+            for docker in _live_dockers():
+                docker._installing = True
+                docker._update_install_buttons()
+                docker._set_backend_text("Instalando backend…", "yellow")
+
+    def _on_install_line(self, text):
+        self._install_log.setVisible(True)
+        self._install_log.appendPlainText(text)
+
+    def _on_install_step(self, title):
+        self._installing = True
+        self._update_install_buttons()
+        self._set_backend_text(f"Instalando backend: {title}…", "yellow")
+
+    def _on_install_done(self, ok, message):
+        self._installing = False
+        self._update_install_buttons()
+        if ok:
+            self._set_status("Backend instalado ✓", "green")
+        elif message == "cancelado":
+            self._set_status("Instalación cancelada — «Instalar backend» "
+                             "retoma donde quedó", "yellow")
         else:
-            self._set_status("No hay server iniciado desde acá", "grey")
+            self._set_status(f"La instalación falló: {message}", "red")
+        _get_manager().configure(_config_from_settings())
 
     # ----- segmentación -----
 
@@ -537,23 +857,65 @@ class AutoSelectDocker(DockWidget):
     def _segment(self, prompt_payload):
         if self._busy:
             return
+        if self._installing:
+            self._set_status("Esperá a que termine la instalación", "yellow")
+            return
         image_b64, doc = self._grab_canvas_b64()
         if image_b64 is None:
             self._set_status("No hay documento abierto", "red")
             return
-        self._busy = True
-        self._select_btn.setEnabled(False)
-        self._set_status("Segmentando... (la primera vez carga el modelo)",
-                         "yellow")
+        self._set_busy(True)
         payload = {"image_b64": image_b64, "combine": "union"}
         payload.update(prompt_payload)
-        self._client.segment(payload)
+        self._pending = payload
+        self._retry_left = 1
+        self._request_backend()
+
+    def _set_busy(self, busy):
+        self._busy = busy
+        _get_manager().set_busy(busy)
+        self._select_btn.setEnabled(not busy)
+
+    def _request_backend(self):
+        """Primero el backend (reusar o arrancar, en un hilo); el pedido
+        sale en _on_backend_ready."""
+        self._set_status("Preparando el backend…", "yellow")
+        client = self._client
+        _get_manager().ensure_ready(
+            lambda ok, msg: _safe_emit(client.ready, ok, msg))
+
+    def _on_backend_ready(self, ok, message):
+        if self._pending is None:
+            return
+        if not ok:
+            self._pending = None
+            self._set_busy(False)
+            self._set_status(message or "El backend no está disponible",
+                             "red")
+            return
+        self._set_status("Segmentando… (la primera vez carga el modelo)",
+                         "yellow")
+        self._client.segment(self._pending)
 
     def _on_segment_result(self, data):
-        self._busy = False
-        self._select_btn.setEnabled(True)
+        if data.get("_conn") and self._retry_left > 0 and self._pending:
+            # El daemon se cayó en medio del pedido (crash nativo de torch):
+            # el supervisor lo relanza; reintentar una vez.
+            self._retry_left -= 1
+            self._set_status("El backend se cayó; reintentando…", "yellow")
+            QTimer.singleShot(1500, self._request_backend)
+            return
+        self._pending = None
+        self._set_busy(False)
+        _get_manager().refresh()
         if data.get("error"):
-            self._set_status(data["error"], "red")
+            error = data["error"]
+            if "out of memory" in error.lower():
+                error = ("Sin VRAM libre para SAM 3: otro programa (ComfyUI, "
+                         "un juego…) ocupa la GPU y no la liberó. Probá de "
+                         "nuevo cuando termine. Detalle en «Ver log».")
+                self._status.setToolTip(data["error"])
+            self._set_status(error, "red")
             return
         if not data.get("count") or not data.get("mask_b64"):
             self._set_status("No encontré nada con ese prompt", "yellow")
@@ -769,13 +1131,104 @@ class AutoSelectExtension(Extension):
     Configurar Krita → Atajos de teclado)."""
 
     def setup(self):
-        pass
+        _get_hub()
+        manager = _get_manager()
+        try:
+            notifier = Krita.instance().notifier()
+            notifier.setActive(True)
+            notifier.applicationClosing.connect(_shutdown)
+        except Exception:
+            pass
+        atexit.register(_shutdown)
+        if _read_bool("autostart", False):
+            QTimer.singleShot(2000, manager.ensure_ready)
 
     def createActions(self, window):
         action = window.createAction(
             "kritaautoselect_toggle_click", "AI Select: modo click",
             "tools/scripts")
         action.triggered.connect(_toggle_click_mode_action)
+
+
+def _safe_emit(signal, *args):
+    try:
+        signal.emit(*args)
+    except RuntimeError:
+        pass  # el docker se destruyó mientras tanto
+
+
+def _live_dockers():
+    alive = []
+    for docker in _dockers:
+        try:
+            docker.objectName()
+            alive.append(docker)
+        except RuntimeError:
+            continue
+    return alive
+
+
+class LogDialog(QDialog):
+    """Visor del log del daemon y del instalador (se refresca solo)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI Select — log del backend")
+        self.resize(820, 480)
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self._which = QComboBox()
+        self._which.addItem("Daemon", "daemon")
+        self._which.addItem("Instalación", "install")
+        self._which.currentIndexChanged.connect(self.reload)
+        top.addWidget(self._which)
+        self._path_label = QLabel()
+        self._path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        top.addWidget(self._path_label, 1)
+        folder = QPushButton("Abrir carpeta")
+        folder.clicked.connect(self._open_folder)
+        top.addWidget(folder)
+        layout.addLayout(top)
+        self._text = QPlainTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(self._text)
+        self._cfg = None
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.reload)
+
+    def show_log(self, cfg):
+        self._cfg = cfg
+        self.reload()
+        self.show()
+        self.raise_()
+        self._timer.start(2000)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def _path(self):
+        if self._cfg is None:
+            return ""
+        if self._which.currentData() == "install":
+            return self._cfg.install_log
+        return self._cfg.daemon_log
+
+    def reload(self, *_):
+        path = self._path()
+        self._path_label.setText(path)
+        text = bk.tail_file(path, max_lines=400, max_bytes=256 * 1024)
+        if text != self._text.toPlainText():
+            self._text.setPlainText(text or "(vacío)")
+            bar = self._text.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+    def _open_folder(self):
+        if self._cfg is not None:
+            os.makedirs(self._cfg.log_dir, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._cfg.log_dir))
 
 
 def _toggle_click_mode_action():
