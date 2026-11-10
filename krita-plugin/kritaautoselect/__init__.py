@@ -10,20 +10,48 @@ Docker estilo krita-ai-diffusion que habla con el daemon krita-autoselect
 La red corre en un thread (nunca en el hilo de UI de Krita); el resultado
 vuelve por señal Qt y la selección se aplica en el main thread.
 """
+import sys
+
 from krita import (
     DockWidget, DockWidgetFactory, DockWidgetFactoryBase, Extension, Krita,
     Selection,
 )
-from PyQt5.QtCore import QEvent, QObject, QPointF, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QImage, QPalette
-from PyQt5.QtWidgets import (
-    QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
-    QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QOpenGLWidget,
-    QPlainTextEdit, QPushButton, QRubberBand, QSpinBox, QToolButton,
-    QVBoxLayout, QWidget,
-)
-from PyQt5.QtCore import QPoint, QRect, QSize
-from PyQt5.QtCore import QBuffer, QByteArray, QIODevice
+
+# Krita 5 usa PyQt5 (Qt5); Krita 6 usa PyQt6 (Qt6). El módulo `krita` ya
+# importó el binding correcto antes que nosotros (y en Krita 5.3+/6 bloquea
+# importar el otro), así que seguimos al que esté cargado. Mismo patrón que
+# los plugins oficiales de Krita 6 (try PyQt6 / except PyQt5).
+_USE_QT6 = "PyQt6.QtCore" in sys.modules or "PyQt5.QtCore" not in sys.modules
+if _USE_QT6:
+    try:
+        from PyQt6.QtCore import (
+            QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QPointF,
+            QRect, QSize, Qt, QTimer, pyqtSignal,
+        )
+        from PyQt6.QtGui import QColor, QImage, QPalette
+        from PyQt6.QtWidgets import (
+            QAbstractScrollArea, QApplication, QCheckBox, QComboBox,
+            QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+            QPlainTextEdit, QPushButton, QRubberBand, QSpinBox, QToolButton,
+            QVBoxLayout, QWidget,
+        )
+        # Qt6 movió QOpenGLWidget de QtWidgets a su propio módulo.
+        from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+    except ImportError:
+        _USE_QT6 = False
+if not _USE_QT6:
+    from PyQt5.QtCore import (  # noqa: F811
+        QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QPointF,
+        QRect, QSize, Qt, QTimer, pyqtSignal,
+    )
+    from PyQt5.QtGui import QColor, QImage, QPalette  # noqa: F811
+    from PyQt5.QtWidgets import (  # noqa: F811
+        QAbstractScrollArea, QApplication, QCheckBox, QComboBox,
+        QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+        QOpenGLWidget, QPlainTextEdit, QPushButton, QRubberBand, QSpinBox,
+        QToolButton, QVBoxLayout, QWidget,
+    )
+
 import base64
 import http.client
 import json
@@ -43,10 +71,40 @@ SAFE_TOOL = "KisToolSelectOutline"
 # Dockers vivos (para la acción de atajo de teclado).
 _dockers = []
 
+# Clases C++ del canvas de Krita (OpenGL y fallback QPainter).
+CANVAS_CLASSES = ("KisOpenGLCanvas2", "KisQPainterCanvas")
+
+
+def _event_pos(event):
+    """Posición local del mouse como QPoint (Qt6: position(); Qt5: pos())."""
+    if hasattr(event, "position"):
+        return event.position().toPoint()
+    return event.pos()
+
+
+def _event_posf(event):
+    """Posición local del mouse como QPointF (subpíxel en Qt6)."""
+    if hasattr(event, "position"):
+        return QPointF(event.position())
+    return QPointF(event.pos())
+
+
+def _find_canvas_widgets(qwin):
+    """Widgets del canvas en la ventana. En ambas versiones el canvas OpenGL
+    es un QOpenGLWidget (Qt6: QtOpenGLWidgets); si no hay ninguno, se busca
+    por nombre de clase C++ (cubre el canvas QPainter)."""
+    if qwin is None:
+        return []
+    targets = qwin.findChildren(QOpenGLWidget)
+    if not targets:
+        targets = [w for w in qwin.findChildren(QWidget)
+                   if w.metaObject().className() in CANVAS_CLASSES]
+    return targets
+
 
 def _palette_colors():
     """Colores según el tema de Krita (patrón de ai_diffusion/ui/theme.py)."""
-    is_dark = QApplication.palette().color(QPalette.Window).lightness() < 128
+    is_dark = QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
     if is_dark:
         return {"green": "#3b3", "yellow": "#cc3", "red": "#c33",
                 "grey": "#888"}
@@ -132,7 +190,7 @@ class CanvasClickFilter(QObject):
         if view is None or doc is None or \
                 not hasattr(view, "flakeToImageTransform"):
             return None, None
-        point = view.flakeToImageTransform().map(QPointF(event.pos()))
+        point = view.flakeToImageTransform().map(_event_posf(event))
         return (int(point.x()), int(point.y())), doc
 
     def eventFilter(self, obj, event):
@@ -140,29 +198,29 @@ class CanvasClickFilter(QObject):
             etype = event.type()
             if obj not in self.canvas_widgets:
                 return False
-            if etype == QEvent.MouseMove:
+            if etype == QEvent.Type.MouseMove:
                 if self._press_pos is None:
                     return False  # hover normal: no tocar
                 if self._rubber is None and \
-                        (event.pos() - self._press_pos).manhattanLength() > \
+                        (_event_pos(event) - self._press_pos).manhattanLength() > \
                         self.DRAG_THRESHOLD_PX:
-                    self._rubber = QRubberBand(QRubberBand.Rectangle,
+                    self._rubber = QRubberBand(QRubberBand.Shape.Rectangle,
                                                self._press_widget)
                 if self._rubber is not None:
                     self._rubber.setGeometry(
-                        QRect(self._press_pos, event.pos()).normalized())
+                        QRect(self._press_pos, _event_pos(event)).normalized())
                     self._rubber.show()
                 return True
-            if etype not in (QEvent.MouseButtonPress,
-                             QEvent.MouseButtonRelease,
-                             QEvent.MouseButtonDblClick):
+            if etype not in (QEvent.Type.MouseButtonPress,
+                             QEvent.Type.MouseButtonRelease,
+                             QEvent.Type.MouseButtonDblClick):
                 return False
-            if event.button() != Qt.LeftButton:
+            if event.button() != Qt.MouseButton.LeftButton:
                 return False
-            if etype == QEvent.MouseButtonDblClick:
+            if etype == QEvent.Type.MouseButtonDblClick:
                 return True
-            if etype == QEvent.MouseButtonPress:
-                self._press_pos = QPoint(event.pos())
+            if etype == QEvent.Type.MouseButtonPress:
+                self._press_pos = QPoint(_event_pos(event))
                 self._press_widget = obj
                 return True
 
@@ -196,9 +254,9 @@ class CanvasClickFilter(QObject):
                 return True
 
             if 0 <= x2 < doc.width() and 0 <= y2 < doc.height():
-                if event.modifiers() & Qt.ControlModifier:
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                     kind = "neg"
-                elif event.modifiers() & Qt.ShiftModifier:
+                elif event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                     kind = "pos"
                 else:
                     kind = "new"
@@ -215,13 +273,13 @@ class AutoSelectDocker(DockWidget):
         self._colors = _palette_colors()
         self._client = DaemonClient(self)
         self._client.finished.connect(self._on_segment_result,
-                                      Qt.QueuedConnection)
-        self._client.health.connect(self._on_health, Qt.QueuedConnection)
+                                      Qt.ConnectionType.QueuedConnection)
+        self._client.health.connect(self._on_health, Qt.ConnectionType.QueuedConnection)
         self._click_filter = CanvasClickFilter(self)
         self._click_filter.clicked.connect(self._on_canvas_click,
-                                           Qt.QueuedConnection)
+                                           Qt.ConnectionType.QueuedConnection)
         self._click_filter.dragged.connect(self._on_canvas_drag,
-                                           Qt.QueuedConnection)
+                                           Qt.ConnectionType.QueuedConnection)
         self._filtered_widgets = []
         self._server_process = None
         self._busy = False
@@ -261,7 +319,7 @@ class AutoSelectDocker(DockWidget):
             'Qué seleccionar, ej: "the red car"  (Shift+Enter)')
         self._prompt.setFixedHeight(52)
         self._prompt.setTabChangesFocus(True)
-        self._prompt.setFrameStyle(QFrame.NoFrame)
+        self._prompt.setFrameStyle(QFrame.Shape.NoFrame)
         self._prompt.installEventFilter(self)
         layout.addWidget(self._prompt)
 
@@ -351,9 +409,9 @@ class AutoSelectDocker(DockWidget):
 
     def eventFilter(self, obj, event):
         try:
-            if obj is self._prompt and event.type() == QEvent.KeyPress:
-                if event.key() in (Qt.Key_Return, Qt.Key_Enter) and \
-                        event.modifiers() & Qt.ShiftModifier:
+            if obj is self._prompt and event.type() == QEvent.Type.KeyPress:
+                if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and \
+                        event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                     self._segment_from_prompt()
                     return True
         except Exception:
@@ -432,10 +490,10 @@ class AutoSelectDocker(DockWidget):
         image = doc.projection(0, 0, w, h)
         ba = QByteArray()
         buf = QBuffer(ba)
-        buf.open(QIODevice.WriteOnly)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
         image.save(buf, "PNG")
         buf.close()
-        return base64.b64encode(bytes(ba)).decode("ascii"), doc
+        return base64.b64encode(bytes(ba.data())).decode("ascii"), doc
 
     def _segment_from_prompt(self):
         text = self._prompt.toPlainText().strip()
@@ -538,9 +596,9 @@ class AutoSelectDocker(DockWidget):
         img.loadFromData(base64.b64decode(mask_b64))
         w, h = doc.width(), doc.height()
         if img.width() != w or img.height() != h:
-            img = img.scaled(w, h, Qt.IgnoreAspectRatio,
-                             Qt.SmoothTransformation)
-        img = img.convertToFormat(QImage.Format_Grayscale8)
+            img = img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
 
         feather = self._feather.value()
         if feather > 0:
@@ -549,10 +607,10 @@ class AutoSelectDocker(DockWidget):
             small_w = max(1, w // (factor + 1))
             small_h = max(1, h // (factor + 1))
             img = (img
-                   .scaled(small_w, small_h, Qt.IgnoreAspectRatio,
-                           Qt.SmoothTransformation)
-                   .scaled(w, h, Qt.IgnoreAspectRatio,
-                           Qt.SmoothTransformation))
+                   .scaled(small_w, small_h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+                   .scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation))
 
         mode = self._mode.currentData()
         action_name = self.SELECT_OPAQUE_ACTIONS.get(mode, "selectopaque")
@@ -602,7 +660,7 @@ class AutoSelectDocker(DockWidget):
             if sel is None or view is None or \
                     not hasattr(view, "flakeToImageTransform"):
                 return
-            gl_widgets = window.qwindow().findChildren(QOpenGLWidget)
+            gl_widgets = _find_canvas_widgets(window.qwindow())
             if not gl_widgets:
                 return
             gl = gl_widgets[0]
@@ -663,12 +721,7 @@ class AutoSelectDocker(DockWidget):
         window = Krita.instance().activeWindow()
         if window is None:
             return 0
-        qwin = window.qwindow()
-        targets = qwin.findChildren(QOpenGLWidget)
-        if not targets:
-            targets = [w for w in qwin.findChildren(QWidget)
-                       if w.metaObject().className()
-                       in ("KisOpenGLCanvas2", "KisQPainterCanvas")]
+        targets = _find_canvas_widgets(window.qwindow())
         if not targets:
             return 0
         self._click_filter.canvas_widgets = targets
@@ -736,6 +789,6 @@ def _toggle_click_mode_action():
 
 Krita.instance().addExtension(AutoSelectExtension(Krita.instance()))
 Krita.instance().addDockWidgetFactory(
-    DockWidgetFactory("aiSelect", DockWidgetFactoryBase.DockRight,
+    DockWidgetFactory("aiSelect", DockWidgetFactoryBase.DockPosition.DockRight,
                       AutoSelectDocker)
 )
