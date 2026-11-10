@@ -15,6 +15,7 @@ El manejo de procesos e hilos está en manager.py; la UI en __init__.py.
 import http.client
 import json
 import os
+import platform as _pyplatform
 import shutil
 import signal
 import subprocess
@@ -48,11 +49,18 @@ TORCH_CUDA_LEGACY = "cu126"
 
 VERIFY_CODE = (
     "import torch, transformers\n"
+    # transformers desactiva en silencio un torch que considera viejo y
+    # Sam3Model queda como placeholder: el import solo no lo detecta.
+    "from transformers.utils import is_torch_available\n"
+    "if not is_torch_available():\n"
+    "    raise SystemExit('transformers ' + transformers.__version__ + "
+    "' no acepta torch ' + torch.__version__ + ' (demasiado viejo)')\n"
     "from transformers import Sam3Model\n"
     "cuda = torch.cuda.is_available()\n"
     "print('torch', torch.__version__, '| transformers', "
     "transformers.__version__, '| cuda', cuda, "
-    "torch.cuda.get_device_name(0) if cuda else '')\n"
+    "torch.cuda.get_device_name(0) if cuda else '', "
+    "'| mps', torch.backends.mps.is_available())\n"
 )
 
 
@@ -380,7 +388,12 @@ def krita_prefixes(environ=None, executable=None):
     if environ.get("APPDIR"):
         prefixes.append(environ["APPDIR"])
     base = os.path.basename(executable or "").lower()
-    if base.startswith("krita"):
+    # macOS: todo lo que está dentro de krita.app (el binario de Krita o su
+    # Python embebido en Contents/Frameworks).
+    bundle, sep, _ = (executable or "").partition(".app/Contents/")
+    if sep and os.path.basename(bundle).lower().startswith("krita"):
+        prefixes.append(bundle + ".app")
+    elif base.startswith("krita"):
         prefixes.append(os.path.dirname(os.path.dirname(executable)))
     return [p.rstrip("\\/") for p in prefixes if p]
 
@@ -395,7 +408,10 @@ def _under(path, prefixes):
 
 def sanitize_env(environ, prefixes=()):
     """Copia del entorno sin el Python de Krita ni rutas del AppImage."""
-    env = {k: v for k, v in environ.items() if k not in _DROP_VARS}
+    # DYLD_*: en macOS harían que el Python del venv cargue las dylibs de
+    # krita.app en vez de las propias.
+    env = {k: v for k, v in environ.items()
+           if k not in _DROP_VARS and not k.startswith("DYLD_")}
     for var in _PATH_LIST_VARS:
         if var not in env:
             continue
@@ -604,6 +620,13 @@ def find_uv(environ=None, platform=None, which=shutil.which,
     return None
 
 
+_MACOS_STUB_PYTHON_DIRS = ("/usr/bin/", "/Library/Developer/CommandLineTools/",
+                           "/Applications/Xcode")
+_MACOS_PYTHONS = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                  "/Library/Frameworks/Python.framework/Versions/Current/bin/"
+                  "python3", "/opt/local/bin/python3")
+
+
 def find_system_python(environ=None, platform=None, which=shutil.which,
                        isfile=os.path.isfile, prefixes=()):
     """argv de un Python del sistema para `-m venv` (nunca el de Krita)."""
@@ -618,6 +641,19 @@ def find_system_python(environ=None, platform=None, which=shutil.which,
             # El python.exe de WindowsApps es un atajo a la Store, no Python.
             if found and "windowsapps" not in found.lower():
                 return [found]
+        return None
+    if plat == "macos":
+        # /usr/bin/python3 es el stub de las Command Line Tools: sin ellas
+        # abre el diálogo de instalación; con ellas es Python 3.9 (viejo
+        # para transformers). Krita abierto desde el Finder tiene PATH
+        # /usr/bin:/bin:/usr/sbin:/sbin, así que Homebrew, python.org y
+        # MacPorts se buscan a mano.
+        found = _which("python3", environ, prefixes, which)
+        if found and not found.startswith(_MACOS_STUB_PYTHON_DIRS):
+            return [found]
+        for candidate in _MACOS_PYTHONS:
+            if isfile(candidate) and not _under(candidate, prefixes):
+                return [candidate]
         return None
     found = _which("python3", environ, prefixes, which)
     if found:
@@ -673,6 +709,34 @@ def detect_nvidia_gpu(environ=None, platform=None, which=shutil.which,
     return None
 
 
+MAC_ARM64 = "arm64"      # Apple Silicon
+MAC_ROSETTA = "rosetta"  # Apple Silicon, con Krita traducido a x86_64
+MAC_INTEL = "x86_64"     # Mac Intel
+
+MAC_INTEL_PROBLEM = (
+    "Mac Intel no soportado: PyTorch dejó de publicar versiones para Mac "
+    "Intel (x86_64) después de la 2.2, y SAM 3 (transformers) necesita "
+    "PyTorch 2.6 o más nuevo. Hace falta un Mac con Apple Silicon (M1 o "
+    "posterior), o un daemon corriendo en otra máquina (con un túnel SSH a "
+    "su puerto).")
+
+
+def macos_cpu(machine=None, run=subprocess.run):
+    """MAC_ARM64 | MAC_ROSETTA | MAC_INTEL. Bajo Rosetta platform.machine()
+    dice x86_64 aunque el Mac sea Apple Silicon: lo aclara sysctl."""
+    machine = machine or _pyplatform.machine()
+    if machine == "arm64":
+        return MAC_ARM64
+    try:
+        proc = run(["/usr/sbin/sysctl", "-n", "sysctl.proc_translated"],
+                   capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0 and proc.stdout.strip() == "1":
+            return MAC_ROSETTA
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return MAC_INTEL
+
+
 def torch_variant(platform=None, gpu=None):
     """(index_url | None, etiqueta) para instalar torch."""
     plat = platform_id(platform)
@@ -689,7 +753,7 @@ def torch_variant(platform=None, gpu=None):
 def build_install_plan(install_dir, bundled_dir, platform=None, uv=None,
                        system_python=None, gpu=None, weights_setting="",
                        hf_token=None, hf_token_from_setting=False,
-                       isfile=os.path.isfile, venv_exists=None):
+                       isfile=os.path.isfile, venv_exists=None, mac_cpu=None):
     """Lista de Step para instalar (o retomar) el backend en install_dir.
 
     Cada paso es idempotente: el venv existente se saltea, uv/pip no
@@ -698,6 +762,8 @@ def build_install_plan(install_dir, bundled_dir, platform=None, uv=None,
     plat = platform_id(platform)
     if not install_dir:
         raise PlanError("Falta la carpeta de instalación.")
+    if plat == "macos" and mac_cpu == MAC_INTEL:
+        raise PlanError(MAC_INTEL_PROBLEM)
     requirements = find_daemon_file("requirements.txt", bundled_dir,
                                     install_dir, isfile)
     downloader = find_daemon_file("download_weights.py", bundled_dir,

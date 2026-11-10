@@ -10,9 +10,15 @@ import base64
 import io
 import json
 import os
+import sys
 import threading
 import time
 import urllib.request
+
+# Apple Silicon: ops without an MPS kernel run on the CPU instead of raising.
+# PyTorch reads this once, when torch is imported (lazily, below).
+if sys.platform == "darwin":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 DEFAULT_MODEL = "facebook/sam3"
 # Model weights (~3.4 GB fp32 / ~1.7 GB bf16) + activations headroom.
@@ -43,7 +49,7 @@ class Sam3Engine:
                  dtype=None, unload_after_s=300.0, comfyui_url=""):
         self.model_id = model_id
         self.weights_path = weights_path or None
-        self.device = device          # None = auto (cuda if available)
+        self.device = device          # None = auto (cuda, mps, else cpu)
         self.dtype_name = dtype       # None = auto (bfloat16 on cuda)
         self.unload_after_s = float(unload_after_s)
         self.comfyui_url = comfyui_url.rstrip("/") if comfyui_url else ""
@@ -122,6 +128,41 @@ class Sam3Engine:
             except Exception:
                 pass
 
+    @staticmethod
+    def _auto_device(torch):
+        """cuda, else Apple Silicon's GPU (mps), else cpu. mps keeps the
+        float32 default: bf16 needs macOS 14+ and not every SAM 3 op has a
+        half-precision MPS kernel; unified memory makes fp32 affordable."""
+        if torch.cuda.is_available():
+            return "cuda"
+        mps = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+        return "cpu"
+
+    @staticmethod
+    def _check_torch_supported(torch):
+        """transformers silently disables a torch it deems too old, and then
+        fails with a misleading "PyTorch not found". Intel Macs always hit
+        this: PyTorch's last x86_64 macOS build is 2.2."""
+        try:
+            from transformers.utils import is_torch_available
+        except ImportError:
+            return
+        if is_torch_available():
+            return
+        import platform
+        msg = (f"The installed PyTorch {torch.__version__} is too old for "
+               "this transformers/SAM 3.")
+        if sys.platform == "darwin" and platform.machine() == "x86_64":
+            msg += (" PyTorch stopped publishing Intel (x86_64) macOS builds "
+                    "after 2.2, so SAM 3 cannot run on an Intel Mac (or an "
+                    "x86_64 Python under Rosetta): use an Apple Silicon Mac, "
+                    "or run this daemon on another machine.")
+        else:
+            msg += " Upgrade torch in the daemon's environment."
+        raise EngineError(msg)
+
     def _load_locked(self):
         self._loading = "detector"
         try:
@@ -131,9 +172,10 @@ class Sam3Engine:
 
     def _load_detector_locked(self):
         import torch
+        self._check_torch_supported(torch)
         from transformers import Sam3Model, Sam3Processor
 
-        device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        device = self.device or self._auto_device(torch)
         if self.dtype_name:
             dtype = getattr(torch, self.dtype_name)
         else:
@@ -179,10 +221,11 @@ class Sam3Engine:
         Same checkpoint as the detector; loaded independently and only when a
         visual-only prompt arrives, so text users never pay for it."""
         import torch
+        self._check_torch_supported(torch)
         from transformers import Sam3TrackerModel, Sam3TrackerProcessor
 
-        device = self._resolved_device or self.device or (
-            "cuda" if torch.cuda.is_available() else "cpu")
+        device = (self._resolved_device or self.device
+                  or self._auto_device(torch))
         if self.dtype_name:
             dtype = getattr(torch, self.dtype_name)
         else:
@@ -224,6 +267,9 @@ class Sam3Engine:
             import torch
             if self._resolved_device and self._resolved_device.startswith("cuda"):
                 torch.cuda.empty_cache()
+            elif self._resolved_device and self._resolved_device.startswith("mps"):
+                # Hand the cached unified memory back to macOS.
+                torch.mps.empty_cache()
         except Exception:
             pass
         print("[autoselect] SAM 3 unloaded (idle)")
