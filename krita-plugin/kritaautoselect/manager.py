@@ -164,10 +164,18 @@ class DaemonManager:
 
     @property
     def owned_alive(self):
+        """¿Hay una sesión propia en curso? Cuenta desde que _start_session
+        la registra, antes de que arranque su hilo: si no, un segundo
+        llamador en ese hueco crearía otra sesión (y al morir el daemon
+        perdedor, _forget dejaría sin seguimiento al que sí corre)."""
         with self._lock:
             s = self._session
-            return bool(s and s.thread and s.thread.is_alive()
-                        and not s.stop_event.is_set())
+            if not s or s.stop_event.is_set():
+                return False
+            t = s.thread
+            # Hilo sin arrancar todavía (ident None) o vivo. Uno que murió
+            # sin marcar stop_event (excepción inesperada) ya no cuenta.
+            return bool(t is None or t.ident is None or t.is_alive())
 
     # ----- estado sin arrancar nada -----
 
@@ -273,18 +281,29 @@ class DaemonManager:
 
     def _wait_ready(self, timeout_s):
         deadline = time.monotonic() + timeout_s
-        with self._cond:
-            while True:
+        while True:
+            with self._cond:
                 state = self._state["state"]
-                if state in (self.READY, self.LOADING):
-                    return True, ""
                 if state in (self.ERROR, self.STOPPED, self.NOT_INSTALLED) \
                         and not self.owned_alive:
                     return False, self._state.get("detail") or state
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    return False, "El backend no respondió a tiempo"
-                self._cond.wait(min(left, 1.0))
+                if state not in (self.READY, self.LOADING):
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return False, "El backend no respondió a tiempo"
+                    self._cond.wait(min(left, 1.0))
+                    continue
+            # READY puede ser viejo: el daemon recién se cayó y el
+            # supervisor todavía no lo vio. Confirmarlo con /health (fuera
+            # del lock) en vez de gastar el único reintento del docker.
+            if self._probe(self._cfg.url, timeout=1.0).kind == "autoselect":
+                return True, ""
+            if not self.owned_alive:
+                return False, "El backend no responde"
+            if time.monotonic() >= deadline:
+                return False, "El backend no respondió a tiempo"
+            with self._cond:
+                self._cond.wait(HEALTH_POLL_S)
 
     def _start_session(self, cfg, install):
         with self._lock:

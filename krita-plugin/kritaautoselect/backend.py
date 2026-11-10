@@ -36,8 +36,16 @@ COMFYUI_FALLBACK_URLS = ("http://127.0.0.1:8188", "http://127.0.0.1:8001")
 # Archivos del daemon que el zip del plugin lleva adentro (carpeta daemon/).
 DAEMON_FILES = ("server.py", "engine.py", "download_weights.py",
                 "requirements.txt")
-# Lo mínimo que tiene que haber en una carpeta de pesos formato HF.
-WEIGHT_MARKERS = ("config.json", "model.safetensors")
+# download_weights.py deja este archivo cuando bajó TODO el repo; sin él
+# (pesos bajados antes de que existiera, o a mano) la carpeta cuenta como
+# completa solo si están todos los archivos que carga Sam3Model/Processor.
+WEIGHTS_DONE_MARKER = ".autoselect-complete"
+WEIGHT_FILES = ("config.json", "model.safetensors", "processor_config.json",
+                "tokenizer.json", "tokenizer_config.json",
+                "special_tokens_map.json", "vocab.json", "merges.txt")
+# El instalador lo escribe en la carpeta de instalación cuando la
+# verificación pasó: un venv sin él quedó a medias (cancelado o fallido).
+INSTALL_DONE_MARKER = ".autoselect-installed"
 VENV_DIR_NAMES = (".venv", "venv")
 PYTHON_FOR_UV = "3.12"
 MIN_SYSTEM_PYTHON = (3, 10)
@@ -80,6 +88,21 @@ VERIFY_CODE = (
     "torch.cuda.get_device_name(0) if cuda else '', "
     "'| mps', torch.backends.mps.is_available())\n"
 )
+# Se suma a VERIFY_CODE cuando el instalador detectó una GPU NVIDIA: un
+# torch que no ve CUDA ahí (driver viejo para cu128, rueda CPU que quedó)
+# correría SAM 3 en CPU, minutos por selección, sin que nadie se entere.
+VERIFY_CUDA_CODE = (
+    "if not cuda:\n"
+    "    raise SystemExit('Hay una GPU NVIDIA pero torch ' + torch.__version__"
+    " + ' no ve CUDA (CUDA de torch: ' + str(torch.version.cuda) + ')')\n"
+)
+CUDA_HINT = ("probablemente el driver de NVIDIA es viejo para esta versión "
+             "de CUDA: actualizalo (nvidia-smi tiene que andar) y volvé a "
+             "«Instalar backend»")
+# Último paso del instalador: argv [python, "-c", MARK_CODE, <marcador>].
+MARK_CODE = ("import sys\n"
+             "with open(sys.argv[1], 'w') as f:\n"
+             "    f.write('ok\\n')\n")
 
 
 # ----------------------------------------------------------------------------
@@ -157,8 +180,11 @@ def find_venv_python(install_dir, platform=None, isfile=os.path.isfile):
 
 
 def weights_complete(path, isfile=os.path.isfile):
-    return bool(path) and all(
-        isfile(os.path.join(path, name)) for name in WEIGHT_MARKERS)
+    if not path:
+        return False
+    if isfile(os.path.join(path, WEIGHTS_DONE_MARKER)):
+        return True
+    return all(isfile(os.path.join(path, name)) for name in WEIGHT_FILES)
 
 
 def default_weights_dir(install_dir, platform=None):
@@ -208,16 +234,18 @@ class Install:
     """Instalación resuelta: qué python corre qué server con qué pesos."""
 
     def __init__(self, install_dir, python, server_script, weights,
-                 venv_broken=False):
+                 venv_broken=False, complete=True):
         self.install_dir = install_dir
         self.python = python
         self.server_script = server_script
         self.weights = weights
         self.venv_broken = venv_broken
+        # False: el instalador del plugin no terminó (sin INSTALL_DONE_MARKER).
+        self.complete = complete
 
     @property
     def ok(self):
-        return bool(self.python and self.server_script)
+        return bool(self.python and self.server_script and self.complete)
 
     def problem(self):
         """Motivo legible (UI en castellano) si no está lista, o None."""
@@ -231,10 +259,29 @@ class Install:
                     "instalación existente.")
         if not self.server_script:
             return "No encuentro server.py del backend (reinstalá el plugin)."
+        if not self.complete:
+            return (f"La instalación en {self.install_dir} quedó a medias "
+                    "(se canceló o falló antes de verificarse). «Instalar "
+                    "backend» la retoma donde quedó.")
         return None
 
     def key(self):
         return (self.python, self.server_script, self.weights)
+
+
+def install_marker(install_dir, platform=None):
+    return _join(platform_id(platform), install_dir, INSTALL_DONE_MARKER)
+
+
+def install_complete(install_dir, platform=None, isfile=os.path.isfile):
+    """¿Terminó el instalador? Una instalación "externa" (checkout del repo:
+    server.py en la raíz, con su .venv armado a mano) nunca pasó por el
+    instalador y cuenta como completa."""
+    if not install_dir:
+        return False
+    plat = platform_id(platform)
+    return (isfile(install_marker(install_dir, plat))
+            or isfile(_join(plat, install_dir, "server.py")))
 
 
 def resolve_install(install_dir, weights_setting, bundled_dir, platform=None,
@@ -246,6 +293,7 @@ def resolve_install(install_dir, weights_setting, bundled_dir, platform=None,
                                        isfile),
         weights=resolve_weights(weights_setting, install_dir, platform, isfile),
         venv_broken=venv_broken(install_dir, platform, isfile),
+        complete=install_complete(install_dir, platform, isfile),
     )
 
 
@@ -447,8 +495,29 @@ def krita_prefixes(environ=None, executable=None):
     if sep and os.path.basename(bundle).lower().startswith("krita"):
         prefixes.append(bundle + ".app")
     elif base.startswith("krita"):
-        prefixes.append(os.path.dirname(os.path.dirname(executable)))
-    return [p.rstrip("\\/") for p in prefixes if p]
+        # <prefix>/bin/krita: solo si <prefix> es una carpeta de Krita
+        # (/opt/krita, C:\Program Files\Krita (x64)). Un Krita de la distro
+        # (/usr/bin/krita) daría /usr y se llevaría /usr/bin del PATH.
+        prefix = os.path.dirname(os.path.dirname(executable)).rstrip("\\/")
+        if "krita" in os.path.basename(prefix).lower():
+            prefixes.append(prefix)
+    return [p.rstrip("\\/") for p in prefixes
+            if p and not _is_system_root(p)]
+
+
+# Carpetas que nunca son "de Krita" aunque algo las sugiera (APPDIR roto,
+# Krita instalado en un prefijo del sistema).
+_SYSTEM_ROOTS = ("", "/usr", "/usr/local", "/usr/bin", "/usr/local/bin",
+                 "/bin", "/opt", "/opt/local", "/opt/homebrew", "/applications",
+                 "/library", "/system")
+
+
+def _is_system_root(path):
+    p = path.replace("\\", "/").rstrip("/").lower()
+    if len(p) == 2 and p[1] == ":":  # unidad sola (C:)
+        return True
+    return p in _SYSTEM_ROOTS or p in ("c:/windows", "c:/program files",
+                                       "c:/program files (x86)")
 
 
 def _under(path, prefixes):
@@ -480,6 +549,9 @@ def sanitize_env(environ, prefixes=()):
 def daemon_env(base_env, port, weights, unload_after_s, comfyui_url,
                hf_token=""):
     env = dict(base_env)
+    # Un AUTOSELECT_TOKEN heredado (p.ej. del shell que abrió Krita) haría
+    # que el daemon propio conteste 401 al plugin, que no manda el header.
+    env.pop("AUTOSELECT_TOKEN", None)
     env.update({
         "AUTOSELECT_PORT": str(port),
         "AUTOSELECT_UNLOAD_AFTER_S": str(unload_after_s),
@@ -762,14 +834,21 @@ def pick_system_python(environ=None, platform=None, which=shutil.which,
                        isfile=os.path.isfile, prefixes=(), run=subprocess.run):
     """(argv | None, problema): el primer Python del sistema que puede crear
     un venv con pip. En Linux/macOS prueba python3 y python3.X (lo corre:
-    versión y ensurepip). En Windows es find_system_python, sin probar."""
+    versión y ensurepip). En Windows prueba el que da find_system_python.
+    En macOS nunca el stub de /usr/bin (abre el diálogo de las Command Line
+    Tools) y sí Homebrew, python.org y MacPorts aunque no estén en PATH."""
     environ = os.environ if environ is None else environ
     plat = platform_id(platform)
     if plat == "windows":
-        return find_system_python(environ, plat, which, isfile, prefixes), ""
-    dirs = ["/usr/bin", "/usr/local/bin"]
+        argv = find_system_python(environ, plat, which, isfile, prefixes)
+        if not argv:
+            return None, ""
+        _, problem = check_venv_python(argv, run, dict(environ))
+        return (None, problem) if problem else (argv, "")
     if plat == "macos":
-        dirs.append("/opt/homebrew/bin")
+        dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+    else:
+        dirs = ["/usr/bin", "/usr/local/bin"]
     candidates = []
     for name in POSIX_PYTHON_NAMES:
         found = _which(name, environ, prefixes, which)
@@ -777,6 +856,11 @@ def pick_system_python(environ=None, platform=None, which=shutil.which,
         candidates += [d + "/" + name for d in dirs
                        if isfile(d + "/" + name)
                        and not _under(d + "/" + name, prefixes)]
+    if plat == "macos":
+        candidates += [p for p in _MACOS_PYTHONS
+                       if isfile(p) and not _under(p, prefixes)]
+        candidates = [p for p in candidates
+                      if not p.startswith(_MACOS_STUB_PYTHON_DIRS)]
     seen, problems = set(), []
     for path in candidates:
         real = os.path.realpath(path)  # python3 -> python3.12: probar 1 vez
@@ -1014,10 +1098,29 @@ def build_install_plan(install_dir, bundled_dir, platform=None, uv=None,
                           "se puede retomar)",
                           [py, "-u", downloader, target], env=env))
 
-    # 5. verificación rápida (importa torch + Sam3Model)
-    steps.append(Step("verify", "Verificar instalación",
-                      [py, "-c", VERIFY_CODE]))
+    # 5. verificación rápida (importa torch + Sam3Model; con GPU NVIDIA,
+    # que torch vea CUDA)
+    if gpu and plat != "macos":
+        steps.append(Step("verify", "Verificar instalación",
+                          [py, "-c", VERIFY_CODE + VERIFY_CUDA_CODE],
+                          hint=CUDA_HINT))
+    else:
+        steps.append(Step("verify", "Verificar instalación",
+                          [py, "-c", VERIFY_CODE]))
+
+    # 6. marcador: sin él la instalación cuenta como a medias (Install.ok)
+    steps.append(Step("done", "Marcar instalación completa",
+                      [py, "-c", MARK_CODE, install_marker(install_dir, plat)]))
     return steps
+
+
+def clear_install_marker(install_dir, platform=None, remove=os.remove):
+    """Al (re)instalar: hasta que el plan termine, la instalación no está
+    completa (un cancel a mitad de un upgrade de torch la deja rota)."""
+    try:
+        remove(install_marker(install_dir, platform))
+    except OSError:
+        pass
 
 
 # ----------------------------------------------------------------------------

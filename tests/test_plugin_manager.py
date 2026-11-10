@@ -13,7 +13,9 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +55,9 @@ class ManagerTest(unittest.TestCase):
             os.symlink(sys.executable, python)
         except (OSError, NotImplementedError):
             shutil.copy(sys.executable, python)
+        # ...that the plugin's installer finished (wrote its marker).
+        open(os.path.join(self.tmp, "install", bk.INSTALL_DONE_MARKER),
+             "w").close()
         self.bundle = os.path.join(self.tmp, "daemon")
         os.makedirs(self.bundle)
         for name in ("server.py", "engine.py"):
@@ -201,6 +206,63 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(log.count("AI Select inicia el daemon"), 2)  # no restarts
         # The owner's daemon still serves both.
         self.assertEqual(bk.probe_health(self.url, 1).kind, "autoselect")
+
+    def test_concurrent_starts_in_one_instance_make_one_session(self):
+        """Two ensure_ready in the same Krita: the second caller, between
+        _start_session registering the session and its thread starting,
+        must wait for it, not create (and then lose track of) another."""
+        m = self.make()
+        install = m.config.resolve()
+        real_thread = threading.Thread
+        started = []
+
+        class SlowStart(real_thread):
+            def start(self):
+                if not started:  # the other caller runs in the gap
+                    started.append(m.owned_alive)
+                    m._start_session(m.config, install)
+                super().start()
+
+        fake = types.SimpleNamespace(Thread=SlowStart, Event=threading.Event)
+        with mock.patch.object(mg, "threading", fake):
+            m._start_session(m.config, install)
+        self.assertEqual(started[0], True)  # registered session counts
+        self.assertTrue(wait_for(lambda: m.snapshot()["state"] == m.READY,
+                                 20))
+        log = bk.tail_file(m.config.daemon_log, 400)
+        self.assertEqual(log.count("AI Select inicia el daemon"), 1)
+        self.assertTrue(m.owned_alive)
+
+    def test_stale_ready_after_crash_waits_for_the_restart(self):
+        """The daemon just died; the supervisor hasn't noticed yet, so the
+        state still says READY. _wait_ready must not report ready on that
+        (the docker's single retry would hit a dead port again)."""
+        m = self.make()
+        self.assertTrue(self.ensure(m)[0])
+        probes = {"n": 0}
+        real = m._probe
+
+        def probe(url, timeout=2.0):
+            probes["n"] += 1
+            if probes["n"] <= 3:  # dead for a moment
+                return bk.HealthProbe("down", error="refused")
+            return real(url, timeout)
+        m._probe = probe
+        t0 = time.monotonic()
+        ok, msg = m._wait_ready(10)
+        self.assertTrue(ok, msg)
+        self.assertGreaterEqual(probes["n"], 4)
+        self.assertGreater(time.monotonic() - t0, 2 * mg.HEALTH_POLL_S - 0.1)
+        # Our session gone and nobody answering: fail fast, don't hang.
+        m.shutdown()
+        self.assertTrue(wait_for(lambda: not m.owned_alive))
+        m._probe = lambda url, timeout=2.0: bk.HealthProbe("down")
+        with m._lock:
+            m._state["state"] = m.READY
+        t0 = time.monotonic()
+        ok, _ = m._wait_ready(10)
+        self.assertFalse(ok)
+        self.assertLess(time.monotonic() - t0, 2)
 
     @unittest.skipIf(os.name == "nt", "POSIX signals")
     def test_daemon_dies_when_krita_is_killed(self):

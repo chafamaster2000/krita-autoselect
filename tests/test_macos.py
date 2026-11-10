@@ -65,8 +65,8 @@ class MacPathsTest(unittest.TestCase):
                          DATA + "/.venv/bin/python")
         inst = bk.resolve_install(DATA, "", "/p/daemon", "darwin", files(
             DATA + "/.venv/bin/python", "/p/daemon/server.py",
-            DATA + "/models/sam3/config.json",
-            DATA + "/models/sam3/model.safetensors"))
+            DATA + "/" + bk.INSTALL_DONE_MARKER,
+            DATA + "/models/sam3/" + bk.WEIGHTS_DONE_MARKER))
         self.assertTrue(inst.ok)
         self.assertEqual(inst.weights, DATA + "/models/sam3")
 
@@ -151,6 +151,42 @@ class MacFinderEnvTest(unittest.TestCase):
             {"PATH": "/opt/homebrew/bin:" + FINDER_PATH}, "darwin",
             fake_which("/opt/homebrew/bin/python3", "/usr/bin/python3"),
             files()), ["/opt/homebrew/bin/python3"])
+
+    def test_pick_system_python_skips_stub_and_finds_framework(self):
+        """The installer calls pick_system_python (it probes the version),
+        not find_system_python: the stub must be skipped there too."""
+        env = {"HOME": HOME, "PATH": FINDER_PATH}
+        which = fake_which("/usr/bin/python3")  # the CLT stub, on PATH
+        framework = ("/Library/Frameworks/Python.framework/Versions/Current/"
+                     "bin/python3")
+        probed = []
+
+        def run(argv, **kw):
+            probed.append(argv[0])
+            return types.SimpleNamespace(returncode=0, stdout="3.12 1\n")
+
+        argv, problem = bk.pick_system_python(
+            env, "darwin", which, files("/usr/bin/python3", framework),
+            run=run)
+        self.assertEqual((argv, problem), ([framework], ""))
+        self.assertNotIn("/usr/bin/python3", probed)  # never executed
+        for path in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                     "/opt/local/bin/python3"):
+            probed.clear()
+            argv, _ = bk.pick_system_python(
+                env, "darwin", which, files("/usr/bin/python3", path),
+                run=run)
+            self.assertEqual(argv, [path])
+            self.assertNotIn("/usr/bin/python3", probed)
+        # Only the stub (and the CLT copy): nothing is probed at all.
+        probed.clear()
+        clt = "/Library/Developer/CommandLineTools/usr/bin"
+        argv, _ = bk.pick_system_python(
+            {"PATH": clt + ":" + FINDER_PATH}, "darwin",
+            fake_which(clt + "/python3", "/usr/bin/python3"),
+            files("/usr/bin/python3"), run=run)
+        self.assertIsNone(argv)
+        self.assertEqual(probed, [])
 
     def test_plan_from_finder_env_uses_pypi_torch(self):
         env = {"HOME": HOME, "PATH": FINDER_PATH}
@@ -368,6 +404,38 @@ class VerifyCodeTest(unittest.TestCase):
 
     def test_reports_mps(self):
         self.assertIn("| mps True", self.run_verify())
+
+    def test_nvidia_gpu_without_cuda_torch_fails(self):
+        """GPU detected but torch can't see CUDA (old driver, CPU wheel)."""
+        p = bk.build_install_plan(
+            "/i", "/p/daemon", "linux", uv="/u/uv", hf_token="t",
+            gpu={"name": "RTX 3090", "compute_cap": (8, 6)},
+            isfile=files("/p/daemon/requirements.txt",
+                         "/p/daemon/download_weights.py"))
+        verify = {s.key: s for s in p}["verify"]
+        code = verify.argv[-1]
+        self.assertIn(bk.VERIFY_CUDA_CODE, code)
+        self.assertTrue(verify.hint)
+        for cuda, fails in ((False, True), (True, False)):
+            modules, torch, _ = fake_ml(cuda=cuda, mps=False)
+            torch.version = types.SimpleNamespace(cuda="12.8")
+            with mock.patch.dict(sys.modules, modules), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                if fails:
+                    with self.assertRaises(SystemExit) as cm:
+                        exec(compile(code, "<verify>", "exec"), {})
+                    self.assertIn("no ve CUDA", str(cm.exception.code))
+                else:
+                    exec(compile(code, "<verify>", "exec"), {})
+        # Without a detected GPU (or on a Mac) CPU torch is expected.
+        for plat, gpu in (("linux", None), ("darwin", None)):
+            p = bk.build_install_plan(
+                "/i", "/p/daemon", plat, uv="/u/uv", hf_token="t", gpu=gpu,
+                isfile=files("/p/daemon/requirements.txt",
+                             "/p/daemon/download_weights.py"),
+                mac_cpu=bk.MAC_ARM64)
+            verify = {s.key: s for s in p}["verify"]
+            self.assertNotIn(bk.VERIFY_CUDA_CODE, verify.argv[-1])
 
     def test_fails_when_transformers_rejects_torch(self):
         """torch 2.2.2 (last Intel-Mac build): Sam3Model would import as a

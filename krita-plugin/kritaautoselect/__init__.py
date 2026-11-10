@@ -231,6 +231,8 @@ def _build_plan(cfg):
         gpu=gpu, weights_setting=cfg.weights_setting, hf_token=token,
         hf_token_from_setting=bool(cfg.hf_token), mac_cpu=mac_cpu,
         python_problem=python_problem)
+    # Hasta que el último paso lo reescriba, la instalación está a medias.
+    bk.clear_install_marker(cfg.install_dir)
     tool = ("uv " + uv if uv else
             "python " + " ".join(system_python) if system_python else
             "venv existente")
@@ -248,18 +250,14 @@ class DaemonClient(QObject):
     finished = pyqtSignal(dict)   # respuesta de /segment (o {"error": ...})
     ready = pyqtSignal(bool, str)  # backend listo (o no) para un pedido
 
-    @property
-    def base(self):
-        return _read_setting("server_url", DEFAULT_URL)
-
     def _request(self, method, path, payload, timeout, signal):
+        # En el hilo de UI: la misma URL que usó el manager para el backend.
+        url = _get_manager().config.url
+
         def work():
             try:
-                rest = self.base.split("://", 1)[-1]
-                hostport = rest.partition("/")[0]
-                host, _, port = hostport.partition(":")
-                conn = http.client.HTTPConnection(
-                    host, int(port or 80), timeout=timeout)
+                host, port = bk.parse_url(url)
+                conn = http.client.HTTPConnection(host, port, timeout=timeout)
                 body = json.dumps(payload).encode() if payload else None
                 conn.request(method, path, body,
                              {"Content-Type": "application/json"})

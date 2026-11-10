@@ -36,6 +36,11 @@ REPLACE_ATTEMPTS = 20
 REPLACE_DELAY_S = 0.5
 # Original-format checkpoint, redundant with model.safetensors (~3.4 GB saved).
 SKIP_FILES = {"sam3.pt"}
+# Written once every file is in place; the Krita plugin only treats the
+# folder as complete with it (same name as backend.WEIGHTS_DONE_MARKER).
+DONE_MARKER = ".autoselect-complete"
+# Retrying can't fix these: no access (gated license / token) or no file.
+FATAL_STATUS = (401, 403, 404)
 
 GATED_HELP = (
     "facebook/sam3 is gated on Hugging Face: (1) accept the license at "
@@ -107,6 +112,9 @@ def download_file(client, url, headers, dest, expected_size=None):
                             print(f"  {_fmt(done)}{total}{pct}", flush=True)
             break
         except (httpx.HTTPError, OSError) as e:
+            if isinstance(e, httpx.HTTPStatusError) and \
+                    e.response.status_code in FATAL_STATUS:
+                raise
             print(f"  retry {attempt}/{MAX_ATTEMPTS} at "
                   f"{os.path.getsize(tmp) if os.path.exists(tmp) else 0} "
                   f"bytes: {type(e).__name__}: {e}", flush=True)
@@ -141,6 +149,7 @@ def main(argv=None):
 
     target = args.target
     os.makedirs(target, exist_ok=True)
+    marker = os.path.join(target, DONE_MARKER)
     headers = build_hf_headers()  # picks up the stored login / HF_TOKEN
     try:
         files = list_files(REPO)
@@ -171,7 +180,14 @@ def main(argv=None):
                 if e.response.status_code in (401, 403):
                     print(f"ERROR: {e}\n{GATED_HELP}", flush=True)
                     return 1
+                if e.response.status_code == 404:
+                    print(f"ERROR: {name} not found in {REPO}: {e}",
+                          flush=True)
+                    return 1
                 raise
+    if not args.only:
+        with open(marker, "w") as f:
+            f.write(REPO + "\n")
     print("DONE", flush=True)
     return 0
 

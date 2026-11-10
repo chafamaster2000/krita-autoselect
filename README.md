@@ -35,10 +35,14 @@ at build time; the root files remain the only source.
 
 **Set up the backend** (gear icon in the docker):
 
-- *Already have an install?* Point **Instalación** at it. A folder with a
-  `.venv` (`bin/python` or `Scripts\python.exe`) works, and
-  `models/sam3` inside it is used as the weights automatically. This repo
-  folder itself qualifies.
+- *Already have an install?* Point **Instalación** at it. A checkout of
+  this repo with a `.venv` (`bin/python` or `Scripts\python.exe`) and
+  `server.py` at its root works as is, and `models/sam3` inside it is used
+  as the weights automatically. A folder the plugin's installer set up
+  counts only once the installer finished (it leaves an
+  `.autoselect-installed` marker after the verify step); one that was
+  cancelled halfway shows as not installed until **Instalar backend**
+  completes it.
 - *Starting fresh?* Click **Instalar backend**. It creates a venv in the
   per-user data folder (`~/.local/share/krita-autoselect`,
   `%LOCALAPPDATA%\krita-autoselect`, `~/Library/Application Support/krita-autoselect`)
@@ -48,8 +52,12 @@ at build time; the root files remain the only source.
   and downloads the gated weights (see
   below) using the **Token HF** field or your `hf auth login`. Progress
   shows in the docker; **Cancelar** stops it, and running it again resumes.
-  If you already have the weights, set **Pesos** to their folder and the
-  download is skipped.
+  With an NVIDIA GPU the verify step fails if torch can't see CUDA
+  (usually a driver too old for the CUDA wheels). If you already have the
+  weights, set **Pesos** to their folder and the download is skipped: a
+  folder counts as complete when `download_weights.py` left its
+  `.autoselect-complete` marker or every model, processor and tokenizer
+  file is there.
 - *macOS:* Apple Silicon only; the daemon runs on the GPU through MPS.
   Intel Macs can't run it: PyTorch's last x86_64 macOS build is 2.2 and
   SAM 3 needs a newer one, so the installer says so and stops. Krita opened

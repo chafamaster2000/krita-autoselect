@@ -66,8 +66,7 @@ class PathsTest(unittest.TestCase):
     def test_existing_repo_install_resolves(self):
         """The dev repo (.venv + models/sam3) works with no reinstall."""
         isfile = files("/repo/.venv/bin/python", "/repo/server.py",
-                       "/repo/models/sam3/config.json",
-                       "/repo/models/sam3/model.safetensors")
+                       *("/repo/models/sam3/" + n for n in bk.WEIGHT_FILES))
         inst = bk.resolve_install("/repo", "", "/plugin/daemon", "linux", isfile)
         self.assertTrue(inst.ok)
         self.assertEqual(inst.python, "/repo/.venv/bin/python")
@@ -84,6 +83,58 @@ class PathsTest(unittest.TestCase):
     def test_weights_setting_wins(self):
         self.assertEqual(bk.resolve_weights("/w", "/repo", "linux", files()),
                          "/w")
+
+    def test_half_installed_venv_is_not_installed(self):
+        """Cancel during torch/deps: the venv python exists but the
+        installer never wrote its marker."""
+        isfile = files("/d/.venv/bin/python", "/plugin/daemon/server.py")
+        inst = bk.resolve_install("/d", "", "/plugin/daemon", "linux", isfile)
+        self.assertFalse(inst.ok)
+        self.assertIn("«Instalar backend»", inst.problem())
+        self.assertIn("medias", inst.problem())
+        self.assertEqual(bk.decide_action("down", True, inst.ok, False),
+                         bk.NOT_INSTALLED)
+        done = files("/d/.venv/bin/python", "/plugin/daemon/server.py",
+                     "/d/" + bk.INSTALL_DONE_MARKER)
+        inst = bk.resolve_install("/d", "", "/plugin/daemon", "linux", done)
+        self.assertTrue(inst.ok)
+        self.assertIsNone(inst.problem())
+
+    def test_external_repo_checkout_needs_no_marker(self):
+        """A dev checkout (.venv + server.py at its root, set up by hand)
+        never ran the installer and still counts as installed."""
+        isfile = files("/repo/.venv/bin/python", "/repo/server.py",
+                       "/plugin/daemon/server.py")
+        inst = bk.resolve_install("/repo", "", "/plugin/daemon", "linux",
+                                  isfile)
+        self.assertTrue(inst.ok)
+
+    def test_this_machines_repo_install_still_resolves(self):
+        """The installed plugin's kritarc points install_dir at the repo
+        checkout; it must keep resolving with its pre-marker weights."""
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        main = os.path.realpath(os.path.join(repo, "..", "..", ".."))
+        if not os.path.isfile(os.path.join(main, ".venv", "bin", "python")):
+            self.skipTest("no repo checkout with a .venv here")
+        inst = bk.resolve_install(main, "", "", "linux")
+        self.assertTrue(inst.ok, inst.problem())
+        if os.path.isdir(os.path.join(main, "models", "sam3")):
+            self.assertEqual(inst.weights,
+                             os.path.join(main, "models", "sam3"))
+
+    def test_weights_need_marker_or_every_file(self):
+        w = "/w"
+        partial = files(w + "/config.json", w + "/model.safetensors")
+        self.assertFalse(bk.weights_complete(w, partial))
+        self.assertIsNone(bk.resolve_weights("", "/i", "linux", files(
+            "/i/models/sam3/config.json",
+            "/i/models/sam3/model.safetensors")))
+        # downloaded before the marker existed: every file is there
+        self.assertTrue(bk.weights_complete(
+            w, files(*(w + "/" + n for n in bk.WEIGHT_FILES))))
+        self.assertTrue(bk.weights_complete(
+            w, files(w + "/" + bk.WEIGHTS_DONE_MARKER)))
+        self.assertFalse(bk.weights_complete("", files()))
 
     def test_missing_venv_is_a_readable_problem(self):
         inst = bk.resolve_install("/nowhere", "", "/plugin/daemon", "linux",
@@ -220,6 +271,32 @@ class EnvTest(unittest.TestCase):
         self.assertEqual(bk.krita_prefixes({}, "/opt/krita/bin/krita"),
                          ["/opt/krita"])
 
+    def test_distro_krita_never_strips_system_dirs(self):
+        """sys.executable /usr/bin/krita would give the prefix /usr."""
+        for exe in ("/usr/bin/krita", "/usr/local/bin/krita", "/bin/krita",
+                    "/krita", "/opt/kde/bin/krita"):
+            self.assertEqual(bk.krita_prefixes({}, exe), [], exe)
+        for appdir in ("/", "/usr", "/usr/local/"):
+            self.assertEqual(bk.krita_prefixes({"APPDIR": appdir},
+                                               "/usr/bin/krita"), [])
+        prefixes = bk.krita_prefixes({}, "/usr/bin/krita")
+        env = bk.sanitize_env({"PATH": "/usr/local/bin:/usr/bin:/bin"},
+                              prefixes)
+        self.assertEqual(env["PATH"], "/usr/local/bin:/usr/bin:/bin")
+        run = FakeRun({"/usr/bin/python3": "3.13 1"})
+        argv, _ = bk.pick_system_python(
+            env, "linux", lambda n, path=None: {
+                "python3": "/usr/bin/python3"}.get(n),
+            files(), prefixes, run)
+        self.assertEqual(argv, ["/usr/bin/python3"])
+        smi = []
+        bk.detect_nvidia_gpu(env, "linux", lambda n, path=None: {
+            "nvidia-smi": "/usr/bin/nvidia-smi"}.get(n),
+            lambda argv, **kw: smi.append(argv[0]) or
+            type("P", (), {"returncode": 0, "stdout": "RTX, 8.6\n"})(),
+            prefixes)
+        self.assertEqual(smi, ["/usr/bin/nvidia-smi"])
+
     def test_daemon_env(self):
         env = bk.daemon_env({"HOME": "/h"}, 5679, "/w", 300,
                             "http://127.0.0.1:8188", "tok")
@@ -229,6 +306,9 @@ class EnvTest(unittest.TestCase):
         self.assertEqual(env["AUTOSELECT_PARENT_WATCH"], "stdin")
         self.assertEqual(env["HF_TOKEN"], "tok")
         bare = bk.daemon_env({}, 1, None, 0, "", "")
+        # An inherited token would make our own daemon answer 401 to us.
+        self.assertNotIn("AUTOSELECT_TOKEN", bk.daemon_env(
+            {"AUTOSELECT_TOKEN": "s3cret"}, 1, None, 0, "", ""))
         self.assertNotIn("AUTOSELECT_WEIGHTS_PATH", bare)
         self.assertNotIn("HF_TOKEN", bare)
 
@@ -326,11 +406,38 @@ class InstallPlanTest(unittest.TestCase):
     def test_rerun_skips_existing_venv_and_weights(self):
         isfile = files("/p/daemon/requirements.txt",
                        "/p/daemon/download_weights.py", "/i/.venv/bin/python",
-                       "/w/config.json", "/w/model.safetensors")
+                       "/w/" + bk.WEIGHTS_DONE_MARKER)
         p = self.plan(isfile=isfile, weights_setting="/w", hf_token=None)
         self.assertTrue(p["venv"].skipped)
         self.assertTrue(p["weights"].skipped)
         self.assertFalse(p["torch"].skipped)  # uv/pip are idempotent
+        # cancelled after model.safetensors, before the tokenizer files
+        partial = files("/p/daemon/requirements.txt",
+                        "/p/daemon/download_weights.py",
+                        "/w/config.json", "/w/model.safetensors")
+        p = self.plan(isfile=partial, weights_setting="/w")
+        self.assertFalse(p["weights"].skipped)
+
+    def test_plan_ends_writing_the_install_marker(self):
+        steps = bk.build_install_plan(
+            "/i", "/p/daemon", "linux", uv="/u/uv", hf_token="tok",
+            isfile=self.BUNDLE)
+        self.assertEqual([s.key for s in steps][-2:], ["verify", "done"])
+        self.assertEqual(steps[-1].argv[-1], "/i/" + bk.INSTALL_DONE_MARKER)
+        # The marker code really writes the file, and clearing removes it.
+        import subprocess
+        import tempfile
+        d = tempfile.mkdtemp()
+        argv = [sys.executable] + bk.build_install_plan(
+            d, "/p/daemon", "linux", uv="/u/uv", hf_token="tok",
+            isfile=lambda p: p.startswith("/p/") or os.path.isfile(p)
+        )[-1].argv[1:]
+        subprocess.run(argv, check=True)
+        self.assertTrue(bk.install_complete(d, "linux"))
+        bk.clear_install_marker(d, "linux")
+        self.assertFalse(bk.install_complete(d, "linux"))
+        bk.clear_install_marker(d, "linux")  # already gone: no error
+        os.rmdir(d)
 
     def test_token_from_setting_is_passed_to_downloader(self):
         p = self.plan(hf_token="hf_x", hf_token_from_setting=True)

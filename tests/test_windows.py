@@ -141,8 +141,8 @@ class WindowsPathsTest(unittest.TestCase):
         repo = "D:\\src\\krita-autoselect"
         isfile = files(repo + "\\" + joins["python"],
                        repo + "\\" + joins["server"],
-                       repo + "\\" + joins["weights"] + "\\config.json",
-                       repo + "\\" + joins["weights"] + "\\model.safetensors")
+                       *(repo + "\\" + joins["weights"] + "\\" + name
+                         for name in bk.WEIGHT_FILES))
         with windows_os():
             inst = bk.resolve_install(repo, "", "", "win32", isfile)
         self.assertTrue(inst.ok)
@@ -189,6 +189,30 @@ class WindowsEnvTest(unittest.TestCase):
                 WIN_ENV, "win32",
                 lambda n, path=None: {"py.exe": "C:\\WINDOWS\\py.exe"}.get(n),
                 files(), prefixes), ["C:\\WINDOWS\\py.exe", "-3"])
+
+    def test_system_python_version_is_checked(self):
+        """py -3 resolving to an old Python (3.8) must not build the venv."""
+        which = lambda n, path=None: {"py.exe": "C:\\WINDOWS\\py.exe"}.get(n)
+        calls = []
+
+        def run(answer):
+            def _run(argv, **kw):
+                calls.append(argv[:2])
+                return types.SimpleNamespace(returncode=0, stdout=answer)
+            return _run
+
+        with windows_os():
+            argv, problem = bk.pick_system_python(
+                WIN_ENV, "win32", which, files(), run=run("3.8 1\n"))
+            self.assertIsNone(argv)
+            self.assertIn("3.10", problem)
+            self.assertEqual(calls, [["C:\\WINDOWS\\py.exe", "-3"]])
+            argv, problem = bk.pick_system_python(
+                WIN_ENV, "win32", which, files(), run=run("3.12 1\n"))
+            self.assertEqual((argv, problem), (["C:\\WINDOWS\\py.exe", "-3"], ""))
+            self.assertEqual(bk.pick_system_python(
+                WIN_ENV, "win32", lambda n, path=None: None, files(),
+                run=run("")), (None, ""))
 
     def test_nvidia_smi_fallback_uses_uppercased_systemroot(self):
         """os.environ copies have uppercase keys on Windows: 'SYSTEMROOT'."""
