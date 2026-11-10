@@ -168,6 +168,77 @@ class ManagerTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(m.snapshot()["state"], m.NOT_INSTALLED)
 
+    def test_two_instances_racing_share_one_daemon(self):
+        """Two Krita instances start at once: both see the port free and both
+        spawn a daemon. The loser's daemon can't bind and exits; it must
+        reuse the winner's daemon instead of crash-looping into an error."""
+        a, b = self.make(), self.make()
+        states_b = []
+        b.add_listener(lambda s: states_b.append(s["state"]))
+        results, done = {}, threading.Event()
+
+        def cb(name):
+            def _cb(ok, msg):
+                results[name] = (ok, msg)
+                if len(results) == 2:
+                    done.set()
+            return _cb
+
+        a.ensure_ready(cb("a"))
+        b.ensure_ready(cb("b"))
+        self.assertTrue(done.wait(30), results)
+        self.assertTrue(results["a"][0] and results["b"][0], results)
+        # Exactly one owns the daemon; the other ends up reusing it.
+        self.assertTrue(wait_for(lambda: a.owned_alive != b.owned_alive,
+                                 timeout=8), (a.snapshot(), b.snapshot()))
+        owner, other = (a, b) if a.owned_alive else (b, a)
+        time.sleep(3)  # past the first restart delay (2 s)
+        self.assertFalse(other.owned_alive)
+        self.assertEqual(other.snapshot()["state"], other.READY)
+        self.assertFalse(other.snapshot()["owned"])
+        self.assertNotIn(b.ERROR, states_b + self.states)
+        log = bk.tail_file(owner.config.daemon_log, 400)
+        self.assertEqual(log.count("AI Select inicia el daemon"), 2)  # no restarts
+        # The owner's daemon still serves both.
+        self.assertEqual(bk.probe_health(self.url, 1).kind, "autoselect")
+
+    @unittest.skipIf(os.name == "nt", "POSIX signals")
+    def test_daemon_dies_when_krita_is_killed(self):
+        """Krita SIGKILLed (no atexit, no applicationClosing): the daemon the
+        plugin started must not outlive it (stdin pipe backstop)."""
+        script = os.path.join(self.tmp, "fake_krita.py")
+        with open(script, "w") as f:
+            f.write(
+                "import os, sys, time\n"
+                f"sys.path.insert(0, {os.path.join(ROOT, 'krita-plugin', 'kritaautoselect')!r})\n"
+                "import manager as mg\n"
+                f"cfg = mg.Config(url={self.url!r}, install_dir={os.path.join(self.tmp, 'install')!r},\n"
+                f"                bundled_dir={self.bundle!r}, comfyui_free=False,\n"
+                f"                data_dir={os.path.join(self.tmp, 'data')!r})\n"
+                "m = mg.DaemonManager(cfg, startup_timeout_s=20)\n"
+                "ok, msg = m._ensure_ready_blocking()\n"
+                "print(m.snapshot()['pid'] if ok else 'FAIL ' + msg, flush=True)\n"
+                "time.sleep(120)\n")
+        krita = subprocess.Popen([sys.executable, script], stdout=subprocess.PIPE,
+                                 text=True)
+        self.addCleanup(krita.wait)
+        self.addCleanup(lambda: krita.poll() is None and krita.kill())
+        line = krita.stdout.readline().strip()
+        self.assertTrue(line.isdigit(), line)
+        daemon_pid = int(line)
+        self.assertEqual(bk.probe_health(self.url, 1).kind, "autoselect")
+        krita.kill()
+        krita.wait()
+
+        def gone():
+            try:
+                os.kill(daemon_pid, 0)
+            except ProcessLookupError:
+                return True
+            # zombie of the dead fake Krita gets reparented and reaped
+            return bk.probe_health(self.url, 0.5).kind == "down"
+        self.assertTrue(wait_for(gone, timeout=10))
+
     @unittest.skipIf(os.name == "nt", "POSIX pipe semantics")
     def test_daemon_exits_when_parent_stdin_closes(self):
         """Krita killed hard: its end of the stdin pipe closes → daemon exits."""
@@ -215,6 +286,14 @@ class InstallRunnerTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("fails", result["msg"])
         self.assertFalse(any("nope" in l for l in lines))
+
+    def test_failure_message_carries_the_step_hint(self):
+        steps = [bk.Step("venv", "venv", [sys.executable, "-c",
+                                          "raise SystemExit(1)"],
+                         hint="sudo apt install python3-venv")]
+        result, _, _ = self.run_plan(steps)
+        self.assertFalse(result["ok"])
+        self.assertIn("sudo apt install python3-venv", result["msg"])
 
     def test_cancel_kills_running_step(self):
         steps = [bk.Step("a", "slow", [sys.executable, "-c",
