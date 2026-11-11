@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 *.whl
 models/
+dist/
+krita-plugin/kritaautoselect/daemon/
