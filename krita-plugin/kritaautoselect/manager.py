@@ -337,7 +337,8 @@ class DaemonManager:
         # de `hf auth login` hecho fuera del sandbox (XDG_CACHE_HOME).
         token, _ = bk.find_hf_token(cfg.hf_token, base)
         env = bk.daemon_env(base, port, install.weights, cfg.unload_after_s,
-                            self._comfyui_url(cfg), token or "")
+                            self._comfyui_url(cfg), token or "",
+                            flats_dir=bk.flats_library_dir())
         log = open(cfg.daemon_log, "ab")
         try:
             header = (f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} "

@@ -82,6 +82,7 @@ VERIFY_CODE = (
     "    raise SystemExit('transformers ' + transformers.__version__ + "
     "' no acepta torch ' + torch.__version__ + ' (demasiado viejo)')\n"
     "from transformers import Sam3Model\n"
+    "import scipy.ndimage, yaml  # auto-flats\n"
     "cuda = torch.cuda.is_available()\n"
     "print('torch', torch.__version__, '| transformers', "
     "transformers.__version__, '| cuda', cuda, "
@@ -547,7 +548,7 @@ def sanitize_env(environ, prefixes=()):
 
 
 def daemon_env(base_env, port, weights, unload_after_s, comfyui_url,
-               hf_token=""):
+               hf_token="", flats_dir=""):
     env = dict(base_env)
     # Un AUTOSELECT_TOKEN heredado (p.ej. del shell que abrió Krita) haría
     # que el daemon propio conteste 401 al plugin, que no manda el header.
@@ -566,6 +567,8 @@ def daemon_env(base_env, port, weights, unload_after_s, comfyui_url,
         env["AUTOSELECT_WEIGHTS_PATH"] = weights
     if hf_token:
         env["HF_TOKEN"] = hf_token
+    if flats_dir:
+        env["AUTOSELECT_FLATS_DIR"] = flats_dir
     return env
 
 
@@ -1158,3 +1161,116 @@ def last_error_line(text):
                 or "no module named" in low):
             return line[:240]
     return lines[-1][:240] if lines else ""
+
+
+# ----------------------------------------------------------------------------
+# Auto-flats (el motor corre en el daemon: POST /flats)
+# ----------------------------------------------------------------------------
+
+CHARACTER_EXTS = (".yaml", ".yml", ".json")
+FLATS_TIMEOUT_S = 900
+_NAME_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+               "0123456789_-. áéíóúñÁÉÍÓÚÑüÜ")
+
+CHARACTER_TEMPLATE = """\
+# Personaje para auto-flats. Todo es opcional salvo `extends`.
+# Se reusa en todos los dibujos de este personaje (docker AI Select ->
+# Auto-flats, o: python -m autoflats DIBUJOS/ --character {name}).
+name: {name}
+extends: default
+
+# Partes que este personaje NO tiene (nombres de capa de la lista default):
+# remove: [Falda, Vestido, Capa, Armadura]
+
+# Cambiar o agregar partes. El orden es la prioridad: `above: X` la pone
+# arriba de X.
+# parts:
+#   Chaleco: {{prompts: [vest, coat], color: "#C62828"}}
+#   Guantes: {{instances: best}}
+#   Medias: {{prompts: [sock cuff], above: Calzado}}
+
+# Colores de este personaje (se reusan en todos sus dibujos):
+# palette:
+#   Piel: "#F2C29B"
+#   Pelo: "#E4E4EA"
+"""
+
+
+def flats_library_dir(platform=None, environ=None):
+    """Carpeta de personajes: AUTOSELECT_FLATS_DIR o <datos>/flats/characters
+    (la misma que usa el daemon para resolver `extends: <nombre>`)."""
+    environ = os.environ if environ is None else environ
+    if environ.get("AUTOSELECT_FLATS_DIR"):
+        return environ["AUTOSELECT_FLATS_DIR"]
+    plat = platform_id(platform)
+    return _join(plat, default_data_dir(platform, environ), "flats",
+                 "characters")
+
+
+def list_characters(folder, listdir=os.listdir, isfile=os.path.isfile):
+    """[(nombre, ruta)] de los archivos de personaje, ordenados."""
+    try:
+        names = listdir(folder)
+    except OSError:
+        return []
+    out, seen = [], set()
+    for fn in sorted(names, key=str.lower):
+        stem, ext = os.path.splitext(fn)
+        path = os.path.join(folder, fn)
+        if ext.lower() in CHARACTER_EXTS and stem not in seen and isfile(path):
+            seen.add(stem)
+            out.append((stem, path))
+    return out
+
+
+def valid_character_name(name):
+    name = (name or "").strip()
+    return bool(name) and len(name) <= 60 and not name.startswith(".") \
+        and all(c in _NAME_OK for c in name)
+
+
+def drawing_override(doc_path, isfile=os.path.isfile):
+    """<dibujo>.flats.yaml al lado del archivo: ajustes de ESTE dibujo
+    (una caja para una parte que SAM no ve, excluir una instancia)."""
+    if not doc_path:
+        return None
+    stem = os.path.splitext(doc_path)[0]
+    for ext in (".flats.yaml", ".flats.yml", ".flats.json"):
+        if isfile(stem + ext):
+            return stem + ext
+    return None
+
+
+def flats_payload(image_b64, config_texts=(), name="drawing"):
+    """config_texts: personaje y después los ajustes del dibujo, en orden."""
+    payload = {"image_b64": image_b64, "name": name,
+               "outputs": ["parts", "report", "overlay"]}
+    texts = [t for t in config_texts if t]
+    if texts:
+        payload["config_text"] = texts
+    return payload
+
+
+def flats_summary(response):
+    """(texto, color, tooltip) para el estado del docker tras /flats."""
+    report = response.get("report") or {}
+    parts = response.get("parts") or []
+    checks = report.get("checks") or []
+    warns = [c["message"] for c in checks if c.get("level") == "warn"]
+    infos = [c["message"] for c in checks if c.get("level") != "warn"]
+    t = report.get("timings") or {}
+    secs = sum(v for k, v in t.items() if k.endswith("_s") and k != "cpu_s")
+    text = f"Auto-flats: {len(parts)} capas"
+    if secs:
+        text += f" en {secs:.0f} s"
+    if warns:
+        text += f" · revisar ({len(warns)}): " + warns[0]
+        color = "yellow"
+    else:
+        text += " · sin avisos"
+        color = "green"
+    tip = "\n".join(["Avisos:"] + ["• " + w for w in warns] if warns else [])
+    if infos:
+        tip += ("\n\n" if tip else "") + "\n".join(
+            ["Notas:"] + ["• " + i for i in infos[:12]])
+    return text, color, tip

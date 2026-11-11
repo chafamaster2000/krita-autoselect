@@ -1,0 +1,23 @@
+# Example character file. Copy it into the library (python -m autoflats
+# --new-character NAME does it for you) and say once what this character
+# wears; every drawing of them reuses it.
+name: Example
+extends: default            # or another character, by name
+
+remove: [Armadura, Capa]    # parts this character never has
+
+parts:
+  # override fields of a default part (by layer name)
+  Abrigo: {prompts: [jacket], color: "#264653"}
+  Guantes: {instances: best}
+  # a new part; `above:` / `below:` place it in the priority order
+  Bufanda: {prompts: [scarf], color: "#E76F51", category: accessory,
+            above: Abrigo}
+
+palette:
+  Pelo: "#2B2D42"
+  Piel: "#E0AC69"
+
+# per-check thresholds (see autoflats/checks.py)
+checks:
+  unlabeled_warn: 0.03

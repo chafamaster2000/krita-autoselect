@@ -1,0 +1,239 @@
+# Default character taxonomy for auto-flats.
+#
+# One entry per output layer. Order = priority, bottom to top: when two parts
+# claim the same pixels, the one further down this file wins (small and
+# specific things go last). A character file can override any field by name,
+# drop parts (`remove:`) or add new ones (see characters/example.yaml).
+#
+# Part fields:
+#   prompts      SAM 3 text prompts; their instances are merged. A prompt can
+#                also be a mapping: {text, threshold, instances, relative,
+#                exclude: [instance indices], box: [x, y, w, h]}.
+#   color        flat colour (a character `palette:` overrides it).
+#   category     skin | garment | footwear | accessory | hair | face | object
+#                (used by the quality checks: two garments fighting over the
+#                same area get flagged).
+#   min_score    drop instances below this SAM score (default 0.3).
+#   instances    all | best | N  — how many instances (by score) to keep.
+#   relative     keep only instances scoring >= best * relative. This is the
+#                "glove also matched the bare fist" lesson: an ambiguous
+#                prompt keeps its confident instances and drops the doubtful
+#                ones.
+#   max_area     drop instances larger than this fraction of the silhouette
+#                (a "glove" that grabbed the whole arm).
+#   min_island   islands smaller than this many px (at 7.5 MP, scaled to
+#                the image size) are absorbed by their neighbours.
+#   alternatives prompts tried only if `prompts` found nothing.
+#   required     warn in the report when the part comes out empty.
+#   slot         body slot(s) the garment fills: top | lower | outer.
+#                Parts sharing a slot are alternatives (pants OR shorts,
+#                coat OR vest); finding both on the same area is flagged.
+#   weak         give way to a same-slot part that scores higher on the
+#                same area (a "dress" that is really a shirt + a skirt).
+#   speck_exempt small enclosed blobs of this part are legitimate (laces,
+#                rivets, lenses): never absorb them into the surrounding part.
+
+name: default
+silhouette:
+  prompts: [person]
+  alternatives: [character, cartoon character, creature, animal]
+line_threshold: auto     # gray level < threshold = ink; auto = Otsu, 90..200
+gap_close: auto          # px of line gap closed before finding regions
+group_name: Flats
+lineart_name: Lineart
+
+parts:
+  - name: Piel
+    category: skin
+    prompts: [arm, leg, neck]
+    color: "#F2C29B"
+    required: true
+
+  - name: Camisa
+    category: garment
+    slot: top
+    prompts: [shirt, t-shirt, blouse]
+    color: "#5B8DB8"
+
+  - name: Pantalón
+    category: garment
+    slot: lower
+    prompts: [pants, jeans]
+    color: "#3F4A62"
+
+  - name: Falda
+    category: garment
+    slot: lower
+    prompts: [skirt]
+    color: "#8E4A6B"
+
+  - name: Shorts
+    category: garment
+    slot: lower
+    prompts: [shorts]
+    color: "#7B1E2B"
+
+  - name: Vestido
+    category: garment
+    slot: [top, lower]
+    weak: true
+    prompts: [dress, robe]
+    color: "#6A4C93"
+
+  - name: Medias
+    category: garment
+    prompts: [sock, stocking]
+    min_score: 0.45
+    color: "#F3EBDD"
+
+  - name: Abrigo
+    category: garment
+    slot: outer
+    prompts: [jacket, coat, hoodie, cardigan]
+    color: "#B0413E"
+
+  - name: Chaleco
+    category: garment
+    slot: outer
+    prompts: [vest]
+    min_score: 0.45
+    color: "#A0522D"
+
+  - name: Capa
+    category: garment
+    prompts: [cape, cloak]
+    min_score: 0.4
+    color: "#7A1F2B"
+
+  - name: Armadura
+    category: garment
+    slot: outer
+    prompts: [armor]
+    min_score: 0.4
+    color: "#9EA7B3"
+
+  - name: Calzado
+    category: footwear
+    prompts: [shoe, boot, sandal]
+    color: "#5D4037"
+
+  - name: Cordones
+    category: footwear
+    prompts: [shoelace]
+    min_score: 0.5
+    color: "#FAFAFA"
+    min_island: 40
+    speck_exempt: true
+
+  - name: Cinturón
+    category: accessory
+    prompts: [belt, strap]
+    min_score: 0.4
+    color: "#4E342E"
+
+  - name: Bolso
+    category: accessory
+    prompts: [bag, backpack]
+    min_score: 0.4
+    color: "#795548"
+
+  - name: Corbata
+    category: accessory
+    prompts: [necktie, neckerchief, bow tie, scarf]
+    min_score: 0.4
+    color: "#C62828"
+
+  - name: Pelaje
+    category: garment
+    prompts: [fur trim]
+    min_score: 0.5
+    color: "#F3EBDD"
+
+  - name: Manos
+    category: skin
+    prompts: [hand, fist]
+    color: "#F2C29B"
+
+  - name: Guantes
+    category: garment
+    prompts: [glove]
+    min_score: 0.5          # a bare fist scores ~0.4 as "glove"
+    relative: 0.85
+    color: "#3E2723"
+
+  - name: Arma
+    category: object
+    prompts: [sword, staff, spear, gun]
+    min_score: 0.45
+    color: "#B0BEC5"
+
+  - name: Metal
+    category: accessory
+    prompts: [metal ring, buckle, necklace, earring]
+    min_score: 0.45
+    color: "#D4A017"
+    min_island: 150
+    speck_exempt: true
+
+  - name: Sombrero
+    category: accessory
+    prompts: [hat, cap, helmet]
+    min_score: 0.45
+    color: "#37474F"
+
+  - name: Cara
+    category: face
+    prompts: [face, ear]
+    color: "#F2C29B"
+    required: true
+
+  - name: Pelo
+    category: hair
+    prompts: [hair, braid, ponytail]
+    color: "#6D4C41"
+
+  - name: Barba
+    category: hair
+    prompts: [beard, mustache]
+    min_score: 0.4
+    color: "#6D4C41"
+
+  - name: Cejas
+    category: hair
+    prompts: [eyebrow]
+    min_score: 0.45
+    color: "#5D4037"
+    min_island: 60
+    speck_exempt: true
+
+  - name: Ojos
+    category: face
+    prompts: [eye]
+    min_score: 0.45
+    color: "#FFFFFF"
+    min_island: 40
+    speck_exempt: true
+
+  - name: Boca
+    category: face
+    prompts: [mouth]
+    min_score: 0.5
+    color: "#C96F6F"
+    min_island: 60
+    speck_exempt: true
+
+  - name: Nariz
+    category: face
+    prompts: [nose]
+    min_score: 0.5
+    color: "#E9A48C"
+    min_island: 60
+    speck_exempt: true
+
+  - name: Anteojos
+    category: accessory
+    prompts: [glasses, eyepatch]
+    min_score: 0.4
+    color: "#D4A017"
+    min_island: 50
+    speck_exempt: true

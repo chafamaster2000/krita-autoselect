@@ -1,7 +1,7 @@
 """Build the self-contained Krita plugin (AI Select) from this repo.
 
 The plugin carries the daemon (server.py, engine.py, download_weights.py,
-requirements.txt) in kritaautoselect/daemon/. Those files are copied from
+requirements.txt and the autoflats/ package) in kritaautoselect/daemon/. Those files are copied from
 the repo root at build time — the root stays the only source of truth, and
 the copies never live in git.
 
@@ -30,6 +30,12 @@ DAEMON_SOURCES = {
     "download_weights.py": os.path.join(ROOT, "scripts", "download_weights.py"),
     "requirements.txt": os.path.join(ROOT, "requirements.txt"),
 }
+# The auto-flats engine runs inside the daemon (POST /flats): ship the
+# whole package next to server.py.
+_AUTOFLATS = os.path.join(ROOT, "autoflats")
+for _fn in sorted(os.listdir(_AUTOFLATS)):
+    if _fn.endswith((".py", ".yaml")):
+        DAEMON_SOURCES[f"autoflats/{_fn}"] = os.path.join(_AUTOFLATS, _fn)
 IGNORED = ("__pycache__", ".pyc", "daemon")
 
 

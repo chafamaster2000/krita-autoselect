@@ -8,3 +8,6 @@ huggingface_hub
 httpx
 pillow
 numpy
+# auto-flats (POST /flats, python -m autoflats)
+scipy
+pyyaml

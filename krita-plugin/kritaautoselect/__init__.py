@@ -37,8 +37,9 @@ if _USE_QT6:
         from PyQt6.QtWidgets import (
             QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDialog,
             QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
-            QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-            QRubberBand, QSpinBox, QToolButton, QVBoxLayout, QWidget,
+            QHBoxLayout, QInputDialog, QLabel, QLineEdit, QPlainTextEdit,
+            QPushButton, QRubberBand, QSpinBox, QToolButton, QVBoxLayout,
+            QWidget,
         )
         # Qt6 movió QOpenGLWidget de QtWidgets a su propio módulo.
         from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -55,8 +56,9 @@ if not _USE_QT6:
     from PyQt5.QtWidgets import (  # noqa: F811
         QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDialog,
         QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
-        QHBoxLayout, QLabel, QLineEdit, QOpenGLWidget, QPlainTextEdit,
-        QPushButton, QRubberBand, QSpinBox, QToolButton, QVBoxLayout, QWidget,
+        QHBoxLayout, QInputDialog, QLabel, QLineEdit, QOpenGLWidget,
+        QPlainTextEdit, QPushButton, QRubberBand, QSpinBox, QToolButton,
+        QVBoxLayout, QWidget,
     )
 
 import atexit
@@ -248,6 +250,7 @@ class DaemonClient(QObject):
     """HTTP hacia el daemon en un thread; resultados por señal Qt (queued)."""
 
     finished = pyqtSignal(dict)   # respuesta de /segment (o {"error": ...})
+    flats_done = pyqtSignal(dict)  # respuesta de /flats
     ready = pyqtSignal(bool, str)  # backend listo (o no) para un pedido
 
     def _request(self, method, path, payload, timeout, signal):
@@ -281,6 +284,9 @@ class DaemonClient(QObject):
 
     def segment(self, payload, timeout=300):
         self._request("POST", "/segment", payload, timeout, self.finished)
+
+    def flats(self, payload, timeout=bk.FLATS_TIMEOUT_S):
+        self._request("POST", "/flats", payload, timeout, self.flats_done)
 
 
 class CanvasClickFilter(QObject):
@@ -403,6 +409,11 @@ class AutoSelectDocker(DockWidget):
                                       Qt.ConnectionType.QueuedConnection)
         self._client.ready.connect(self._on_backend_ready,
                                    Qt.ConnectionType.QueuedConnection)
+        self._client.flats_done.connect(self._on_flats_result,
+                                        Qt.ConnectionType.QueuedConnection)
+        self._pending_kind = "segment"
+        self._flats_target = None   # (doc, uuid del line art) en vuelo
+        self._flats_overlay = ""
         self._click_filter = CanvasClickFilter(self)
         self._click_filter.clicked.connect(self._on_canvas_click,
                                            Qt.ConnectionType.QueuedConnection)
@@ -512,12 +523,286 @@ class AutoSelectDocker(DockWidget):
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
 
+        layout.addWidget(self._build_flats())
+
         self._config = self._build_config()
         self._config.setVisible(False)
         layout.addWidget(self._config)
 
         layout.addStretch()
         self.setWidget(root)
+
+    def _build_flats(self):
+        """Auto-flats: una capa plana por parte (piel, pelo, ropa...) con su
+        máscara de selección, bajo el line art en Multiply."""
+        box = QGroupBox("Auto-flats")
+        col = QVBoxLayout(box)
+        row = QHBoxLayout()
+        self._char_combo = QComboBox()
+        self._char_combo.setToolTip(
+            "Personaje: qué partes tiene, prompts y paleta. «Genérico» usa "
+            "la lista por defecto. Los archivos viven en "
+            + bk.flats_library_dir())
+        row.addWidget(self._char_combo, 1)
+        for icon, tip, slot in (
+                ("document-edit", "Editar el archivo del personaje",
+                 self._edit_character),
+                ("list-add", "Nuevo personaje", self._new_character),
+                ("folder", "Abrir la carpeta de personajes",
+                 self._open_character_dir)):
+            btn = QToolButton()
+            btn.setIcon(Krita.instance().icon(icon))
+            btn.setAutoRaise(True)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+        col.addLayout(row)
+        row = QHBoxLayout()
+        self._flats_btn = QPushButton("Auto-flats del line art")
+        self._flats_btn.setToolTip(
+            "Usa la capa activa como line art: crea un grupo con una capa "
+            "por parte (con su máscara de selección) y deja el line art "
+            "arriba de todo en Multiply. Convierte el documento a RGBA 8 bits "
+            "si hace falta.")
+        self._flats_btn.setMinimumHeight(30)
+        self._flats_btn.clicked.connect(self._run_flats)
+        row.addWidget(self._flats_btn, 1)
+        self._overlay_btn = QToolButton()
+        self._overlay_btn.setIcon(Krita.instance().icon("visible"))
+        self._overlay_btn.setToolTip(
+            "Ver el chequeo de la última corrida: cada parte con su nombre, "
+            "magenta = sin parte, avisos en rojo")
+        self._overlay_btn.setEnabled(False)
+        self._overlay_btn.clicked.connect(self._show_overlay)
+        row.addWidget(self._overlay_btn)
+        col.addLayout(row)
+        self._flats_status = QLabel("")
+        self._flats_status.setWordWrap(True)
+        col.addWidget(self._flats_status)
+        self._reload_characters()
+        return box
+
+    # ----- auto-flats: personajes -----
+
+    def _reload_characters(self, select=None):
+        current = select or self._char_combo.currentData() or \
+            _read_setting("flats_character", "")
+        self._char_combo.blockSignals(True)
+        self._char_combo.clear()
+        self._char_combo.addItem("Genérico (por defecto)", "")
+        for name, path in bk.list_characters(bk.flats_library_dir()):
+            self._char_combo.addItem(name, path)
+        idx = max(0, self._char_combo.findData(current))
+        self._char_combo.setCurrentIndex(idx)
+        self._char_combo.blockSignals(False)
+
+    def _open_character_dir(self):
+        folder = bk.flats_library_dir()
+        os.makedirs(folder, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _edit_character(self):
+        path = self._char_combo.currentData()
+        if not path:
+            self._new_character()
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _new_character(self):
+        name, ok = QInputDialog.getText(self, "Nuevo personaje",
+                                        "Nombre del personaje:")
+        if not ok:
+            return
+        name = name.strip()
+        if not bk.valid_character_name(name):
+            self._flats_status.setText("Nombre inválido (letras, números, - _ .)")
+            return
+        folder = bk.flats_library_dir()
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, name + ".yaml")
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(bk.CHARACTER_TEMPLATE.format(name=name))
+        self._reload_characters(select=path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _set_flats_status(self, text, color="grey", tip=""):
+        self._flats_status.setText(
+            f'<span style="color:{self._colors[color]};">{text}</span>')
+        self._flats_status.setToolTip(tip)
+
+    # ----- auto-flats: correr -----
+
+    def _run_flats(self):
+        if self._busy:
+            return
+        if self._installing:
+            self._set_flats_status("Esperá a que termine la instalación",
+                                   "yellow")
+            return
+        doc = Krita.instance().activeDocument()
+        if doc is None:
+            self._set_flats_status("No hay documento abierto", "red")
+            return
+        node = doc.activeNode()
+        if node is None or node.type() != "paintlayer":
+            self._set_flats_status(
+                "Seleccioná la capa del line art (una capa de pintura)", "red")
+            return
+        path = self._char_combo.currentData() or ""
+        override = bk.drawing_override(doc.fileName())
+        texts = [] if path else (["extends: default\n"] if override else [])
+        for p in (path, override):
+            if not p:
+                continue
+            try:
+                with open(p, encoding="utf-8") as f:
+                    texts.append(f.read())
+            except OSError as e:
+                self._set_flats_status(f"No pude leer {p}: {e}", "red")
+                return
+        _write_setting("flats_character", path)
+        converted = False
+        if doc.colorModel() != "RGBA" or doc.colorDepth() != "U8":
+            # un documento gris (un JPG de line art) volvería gris cada flat
+            doc.setColorSpace("RGBA", "U8", "sRGB-elle-V2-srgbtrc.icc")
+            doc.waitForDone()
+            converted = True
+        w, h = doc.width(), doc.height()
+        raw = bytes(node.projectionPixelData(0, 0, w, h))
+        img = QImage(raw, w, h, QImage.Format.Format_ARGB32).copy()
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        img.save(buf, "PNG")
+        buf.close()
+        image_b64 = base64.b64encode(bytes(ba.data())).decode("ascii")
+        name = os.path.splitext(os.path.basename(doc.fileName() or ""))[0] \
+            or "drawing"
+        self._flats_target = (doc, node.uniqueId())
+        self._pending = bk.flats_payload(image_b64, texts, name)
+        self._pending_kind = "flats"
+        self._retry_left = 1
+        self._set_busy(True)
+        self._set_flats_status(
+            "Auto-flats: segmentando partes…"
+            + (" (documento convertido a RGBA 8 bits)" if converted else ""),
+            "yellow")
+        self._request_backend()
+
+    def _on_flats_result(self, data):
+        if data.get("_conn") and self._retry_left > 0 and self._pending:
+            self._retry_left -= 1
+            self._set_flats_status("El backend se cayó; reintentando…",
+                                   "yellow")
+            QTimer.singleShot(1500, self._request_backend)
+            return
+        self._pending = None
+        self._pending_kind = "segment"
+        self._set_busy(False)
+        _get_manager().refresh()
+        target, self._flats_target = self._flats_target, None
+        if data.get("error"):
+            self._set_flats_status(f"Auto-flats falló: {data['error']}",
+                                   "red", data["error"])
+            return
+        try:
+            self._save_overlay(data)
+            count = self._apply_flats(target, data)
+        except Exception as e:
+            self._set_flats_status(f"Error armando las capas: {e}", "red")
+            return
+        text, color, tip = bk.flats_summary(data)
+        self._set_flats_status(text, color, tip)
+        if not count:
+            self._set_flats_status("Auto-flats: no encontré partes", "yellow",
+                                   tip)
+
+    def _save_overlay(self, data):
+        if not data.get("overlay_png_b64"):
+            return
+        folder = os.path.join(bk.default_data_dir(), "flats", "last")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "overlay.png")
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(data["overlay_png_b64"]))
+        if data.get("report"):
+            with open(os.path.join(folder, "report.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(data["report"], f, indent=1, ensure_ascii=False)
+        self._flats_overlay = path
+        self._overlay_btn.setEnabled(True)
+
+    def _show_overlay(self):
+        if self._flats_overlay and os.path.isfile(self._flats_overlay):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._flats_overlay))
+
+    @staticmethod
+    def _top_siblings(parent):
+        kids = parent.childNodes()
+        if parent.parentNode() is None:  # sin la máscara de selección global
+            kids = [k for k in kids if k.type() != "selectionmask"]
+        return kids
+
+    def _move_to_top(self, doc, node):
+        """Line art arriba de todo. libkis no tiene "mover": remove() suelta
+        los hijos (máscaras), así que se guardan y se vuelven a poner."""
+        root = doc.rootNode()
+        kids = self._top_siblings(root)
+        if kids and kids[-1].uniqueId() == node.uniqueId():
+            return
+        children = list(node.childNodes())
+        node.remove()
+        kids = self._top_siblings(root)
+        root.addChildNode(node, kids[-1] if kids else None)
+        for child in children:
+            node.addChildNode(child, None)
+
+    def _apply_flats(self, target, data):
+        """Respuesta de /flats -> grupo con una capa + máscara por parte,
+        justo debajo del line art; line art en Multiply, bloqueado, arriba."""
+        if target is None:
+            raise RuntimeError("se perdió la referencia al documento")
+        doc, uid = target
+        line = doc.nodeByUniqueID(uid)
+        if line is None:
+            raise RuntimeError("la capa del line art ya no existe")
+        group_name = data.get("group_name") or "Flats"
+        parent = line.parentNode()
+        for child in self._top_siblings(parent):
+            if child.type() == "grouplayer" and child.name() == group_name:
+                child.remove()   # corrida anterior: se reemplaza
+        group = doc.createGroupLayer(group_name)
+        parts = data.get("parts") or []
+        # vienen de arriba hacia abajo; cada addChildNode(…, None) va arriba
+        for part in reversed(parts):
+            img = QImage()
+            img.loadFromData(base64.b64decode(part["png_b64"]))
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
+            w, h = img.width(), img.height()
+            x, y = int(part["x"]), int(part["y"])
+            layer = doc.createNode(part["name"], "paintlayer")
+            layer.setPixelData(QByteArray(img.constBits().asstring(w * h * 4)),
+                               x, y, w, h)
+            group.addChildNode(layer, None)
+            alpha = img.convertToFormat(QImage.Format.Format_Alpha8)
+            bpl = alpha.bytesPerLine()
+            raw = alpha.constBits().asstring(bpl * h)
+            tight = raw if bpl == w else b"".join(
+                raw[i * bpl:i * bpl + w] for i in range(h))
+            sel = Selection()
+            sel.setPixelData(QByteArray(tight), x, y, w, h)
+            mask = doc.createSelectionMask("Sel " + part["name"])
+            mask.setSelection(sel)
+            layer.addChildNode(mask, None)
+        parent.addChildNode(group, line)
+        line.setBlendingMode("multiply")
+        line.setLocked(True)
+        self._move_to_top(doc, line)
+        doc.setActiveNode(line)
+        doc.waitForDone()
+        doc.refreshProjection()
+        return len(parts)
 
     def _build_config(self):
         """Config del backend (oculta por defecto, estilo "Connection")."""
@@ -873,6 +1158,7 @@ class AutoSelectDocker(DockWidget):
         payload = {"image_b64": image_b64, "combine": "union"}
         payload.update(prompt_payload)
         self._pending = payload
+        self._pending_kind = "segment"
         self._retry_left = 1
         self._request_backend()
 
@@ -880,11 +1166,13 @@ class AutoSelectDocker(DockWidget):
         self._busy = busy
         _get_manager().set_busy(busy)
         self._select_btn.setEnabled(not busy)
+        self._flats_btn.setEnabled(not busy)
 
     def _request_backend(self):
         """Primero el backend (reusar o arrancar, en un hilo); el pedido
         sale en _on_backend_ready."""
-        self._set_status("Preparando el backend…", "yellow")
+        if self._pending_kind != "flats":
+            self._set_status("Preparando el backend…", "yellow")
         client = self._client
         _get_manager().ensure_ready(
             lambda ok, msg: _safe_emit(client.ready, ok, msg))
@@ -895,8 +1183,20 @@ class AutoSelectDocker(DockWidget):
         if not ok:
             self._pending = None
             self._set_busy(False)
+            if self._pending_kind == "flats":
+                self._pending_kind = "segment"
+                self._flats_target = None
+                self._set_flats_status(
+                    message or "El backend no está disponible", "red")
+                return
             self._set_status(message or "El backend no está disponible",
                              "red")
+            return
+        if self._pending_kind == "flats":
+            self._set_flats_status(
+                "Auto-flats: segmentando y armando flats… (la primera vez "
+                "carga el modelo)", "yellow")
+            self._client.flats(self._pending)
             return
         self._set_status("Segmentando… (la primera vez carga el modelo)",
                          "yellow")
@@ -1153,6 +1453,10 @@ class AutoSelectExtension(Extension):
             "kritaautoselect_toggle_click", "AI Select: modo click",
             "tools/scripts")
         action.triggered.connect(_toggle_click_mode_action)
+        action = window.createAction(
+            "kritaautoselect_autoflats", "AI Select: auto-flats del line art",
+            "tools/scripts")
+        action.triggered.connect(_autoflats_action)
 
 
 def _safe_emit(signal, *args):
@@ -1234,6 +1538,12 @@ class LogDialog(QDialog):
         if self._cfg is not None:
             os.makedirs(self._cfg.log_dir, exist_ok=True)
             QDesktopServices.openUrl(QUrl.fromLocalFile(self._cfg.log_dir))
+
+
+def _autoflats_action():
+    for docker in _live_dockers():
+        docker._run_flats()
+        return
 
 
 def _toggle_click_mode_action():

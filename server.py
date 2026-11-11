@@ -6,10 +6,17 @@ bounding box, and returns a canvas-sized grayscale mask. Built for `kri
 select sam` (Krita selections) but Krita-independent: POST an image, get a
 mask.
 
-HTTP on 127.0.0.1 only, stdlib server, one endpoint:
-  GET  /health   — daemon + model state
-  POST /segment  — {image_b64, text?, points?, point_labels?, box?,
-                    threshold?, mask_threshold?, combine?, list_only?}
+HTTP on 127.0.0.1 only, stdlib server:
+  GET  /health        — daemon + model state
+  POST /segment       — {image_b64, text?, points?, point_labels?, box?,
+                         threshold?, mask_threshold?, combine?, list_only?}
+  POST /segment_many  — {image_b64, prompts: [{text?, box?, points?,
+                         point_labels?, threshold?, combine?, within?}],
+                         masks?: "instances"|"union"|"none"}: one image,
+                         many prompts; the backbone runs once and the text
+                         prompts go through the detector in batches
+  POST /flats         — {image_b64, config?, config_text?, outputs?}: the
+                         auto-flats pipeline (autoflats/) on one drawing
 
 Env:
   AUTOSELECT_PORT            port (default 5679)
@@ -22,6 +29,9 @@ Env:
   AUTOSELECT_COMFYUI_URL     ComfyUI to ask for VRAM before loading
                              (default http://127.0.0.1:8001; empty disables)
   AUTOSELECT_TOKEN           optional shared token (X-Autoselect-Token)
+  AUTOSELECT_FEATURE_CACHE   images whose vision features stay cached (4)
+  AUTOSELECT_PROMPT_BATCH    text prompts per detector forward (16)
+  AUTOSELECT_FLATS_DIR       auto-flats character library folder
   AUTOSELECT_PARENT_WATCH    "stdin": exit when stdin reaches EOF — set by a
                              parent (the Krita plugin) that keeps the pipe
                              open, so the daemon dies with it even on a crash
@@ -93,6 +103,136 @@ def parse_segment_params(payload):
     }
 
 
+MASK_MODES = ("instances", "union", "none")
+MAX_PROMPTS = 256
+FLATS_OUTPUTS = ("parts", "preview", "overlay", "kra", "ora", "report")
+
+
+def parse_segment_many_params(payload):
+    """Validate /segment_many JSON. Returns (image_b64, prompts, masks,
+    mask_threshold)."""
+    if not isinstance(payload, dict):
+        raise BadRequest("Body must be a JSON object")
+    if not payload.get("image_b64"):
+        raise BadRequest("image_b64 is required")
+    prompts = payload.get("prompts")
+    if not isinstance(prompts, list) or not prompts:
+        raise BadRequest("prompts must be a non-empty list")
+    if len(prompts) > MAX_PROMPTS:
+        raise BadRequest(f"at most {MAX_PROMPTS} prompts per request")
+    out = []
+    for i, p in enumerate(prompts):
+        if isinstance(p, str):
+            p = {"text": p}
+        if not isinstance(p, dict):
+            raise BadRequest(f"prompts[{i}] must be text or an object")
+        try:
+            kw = parse_segment_params(dict(p, image_b64="-"))
+        except BadRequest as e:
+            raise BadRequest(f"prompts[{i}]: {e}")
+        kw.pop("image_b64")
+        kw.pop("list_only")
+        out.append(kw)
+    masks = payload.get("masks", "instances")
+    if masks not in MASK_MODES:
+        raise BadRequest(f"masks must be one of {list(MASK_MODES)}")
+    try:
+        mask_threshold = float(payload.get("mask_threshold", 0.5))
+    except (TypeError, ValueError):
+        raise BadRequest("mask_threshold must be a number")
+    return payload["image_b64"], out, masks, mask_threshold
+
+
+def _mask_png_b64(mask):
+    import base64
+    import io
+    import numpy as np
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.fromarray(mask.astype(np.uint8) * 255, "L").save(
+        buf, "PNG", compress_level=1)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def run_segment_many(engine, image_b64, prompts, masks, mask_threshold):
+    """Engine call + encoding (instances: one PNG crop per instance with
+    its offset in mask_xy; union: canvas-sized PNG per prompt, honouring
+    each prompt's `combine`)."""
+    import numpy as np
+    image = engine.decode_image(image_b64)
+    width, height = image.size
+    results, timing = engine.segment_many(
+        image, prompts, mask_threshold=mask_threshold,
+        crop=(masks == "instances"))
+    out = []
+    for p, (instances, np_masks) in zip(prompts, results):
+        item = {"text": p.get("text"), "count": len(instances),
+                "instances": [dict(i) for i in instances]}
+        if masks == "instances":
+            for inst, m in zip(item["instances"], np_masks):
+                if m.size:
+                    inst["mask_b64"] = _mask_png_b64(m)
+        elif masks == "union" and instances:
+            combine = p.get("combine", "union")
+            chosen = np_masks if combine == "union" else \
+                [np_masks[int(combine)]] if 0 <= int(combine) < len(np_masks) \
+                else []
+            if chosen:
+                final = np.zeros((height, width), bool)
+                for m in chosen:
+                    final |= m
+                item["mask_b64"] = _mask_png_b64(final)
+        out.append(item)
+    return {"width": width, "height": height, "results": out,
+            "timing": timing}
+
+
+def run_flats(engine, payload):
+    """POST /flats: the whole auto-flats pipeline on one drawing."""
+    import base64
+    try:
+        from autoflats import config as cfgmod
+        from autoflats import outputs, pipeline
+        from autoflats.segment import EngineSegmenter
+    except ImportError as e:
+        raise RuntimeError(
+            f"auto-flats needs numpy, scipy and pillow in the daemon's "
+            f"environment ({e}). Re-run «Instalar backend» in AI Select, or "
+            f"pip install scipy in the daemon's venv.")
+    if not isinstance(payload, dict) or not payload.get("image_b64"):
+        raise BadRequest("image_b64 is required")
+    wanted = payload.get("outputs") or ["parts", "report"]
+    bad = [o for o in wanted if o not in FLATS_OUTPUTS]
+    if bad:
+        raise BadRequest(f"unknown outputs {bad} (valid: {list(FLATS_OUTPUTS)})")
+    try:
+        cfg = cfgmod.config_from_request(payload.get("config"),
+                                         payload.get("config_text"))
+    except cfgmod.ConfigError as e:
+        raise BadRequest(f"config: {e}")
+    image = engine.decode_image_any(payload["image_b64"])
+    name = str(payload.get("name") or "drawing")[:80]
+    result = pipeline.run(image, cfg, EngineSegmenter(engine), name=name)
+    out = {"width": result.gray.shape[1], "height": result.gray.shape[0],
+           "verdict": result.report["verdict"]}
+    if "report" in wanted:
+        out["report"] = result.report
+    if "parts" in wanted:
+        out["parts"] = outputs.parts_payload(result)
+        out["lineart_name"] = cfg["lineart_name"]
+        out["group_name"] = cfg["group_name"]
+    enc = lambda b: base64.b64encode(b).decode("ascii")  # noqa: E731
+    if "preview" in wanted:
+        out["preview_png_b64"] = enc(outputs.png_bytes(outputs.preview(result), 3))
+    if "overlay" in wanted:
+        out["overlay_png_b64"] = enc(outputs.png_bytes(outputs.overlay(result), 3))
+    if "kra" in wanted:
+        out["kra_b64"] = enc(outputs.kra_bytes(result, doc_name=name))
+    if "ora" in wanted:
+        out["ora_b64"] = enc(outputs.ora_bytes(result))
+    return out
+
+
 class AutoselectHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # our own prints are enough
@@ -127,7 +267,7 @@ class AutoselectHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._auth_ok():
             return
-        if self.path != "/segment":
+        if self.path not in ("/segment", "/segment_many", "/flats"):
             self._reply({"error": "Unknown endpoint"}, 404)
             return
         try:
@@ -143,12 +283,17 @@ class AutoselectHandler(BaseHTTPRequestHandler):
             self._reply({"error": "Invalid JSON"}, 400)
             return
         try:
-            kwargs = parse_segment_params(payload)
+            if self.path == "/segment_many":
+                args = parse_segment_many_params(payload)
+                result = run_segment_many(self.server.engine, *args)
+            elif self.path == "/flats":
+                result = run_flats(self.server.engine, payload)
+            else:
+                kwargs = parse_segment_params(payload)
+                result = self.server.engine.segment(**kwargs)
         except BadRequest as e:
             self._reply({"error": str(e)}, 400)
             return
-        try:
-            result = self.server.engine.segment(**kwargs)
         except Exception as e:
             print(f"[autoselect] segment failed: {type(e).__name__}: {e}",
                   flush=True)
@@ -197,6 +342,8 @@ def main():
         unload_after_s=float(os.environ.get("AUTOSELECT_UNLOAD_AFTER_S", "300")),
         comfyui_url=os.environ.get("AUTOSELECT_COMFYUI_URL",
                                    "http://127.0.0.1:8001"),
+        feature_cache=int(os.environ.get("AUTOSELECT_FEATURE_CACHE", "4")),
+        prompt_batch=int(os.environ.get("AUTOSELECT_PROMPT_BATCH", "16")),
     )
     port = int(os.environ.get("AUTOSELECT_PORT", DEFAULT_PORT))
     if os.environ.get("AUTOSELECT_PARENT_WATCH") == "stdin":
