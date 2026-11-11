@@ -191,6 +191,8 @@ directory containing the model files.
 | `AUTOSELECT_UNLOAD_AFTER_S` | `300` | idle seconds before freeing VRAM; `0` = resident |
 | `AUTOSELECT_COMFYUI_URL` | `http://127.0.0.1:8001` | ComfyUI to ask for VRAM; empty disables |
 | `AUTOSELECT_TOKEN` | — | require `X-Autoselect-Token` header |
+| `AUTOSELECT_FEATURE_CACHE` | `4` | images whose vision features stay cached (`0` disables) |
+| `AUTOSELECT_PROMPT_BATCH` | `16` | text prompts per detector forward in `/segment_many` (halved on OOM) |
 | `AUTOSELECT_PARENT_WATCH` | — | `stdin`: exit when stdin closes (set by the Krita plugin) |
 | `HF_TOKEN` | — | standard HF auth for the gated weights |
 
@@ -199,9 +201,16 @@ directory containing the model files.
 ### `GET /health`
 
 ```json
-{"status": "ok", "service": "krita-autoselect", "model": "facebook/sam3",
- "loaded": false, "loading": false, "device": null, "unload_after_s": 300.0}
+{"status": "ok", "service": "krita-autoselect", "api_version": 2,
+ "capabilities": ["segment", "segment_many"], "model": "facebook/sam3",
+ "loaded": false, "loading": false, "device": null, "unload_after_s": 300.0,
+ "feature_cache": {"size": 0, "max": 4, "hits": 0, "misses": 0},
+ "prompt_batch": 16}
 ```
+
+Los clientes detectan `/segment_many` mirando `capabilities` (o
+`api_version >= 2`), no esperando un 404. Un daemon viejo (por ejemplo, el
+que trae un plugin AI Select anterior) no manda ninguno de los dos campos.
 
 ### `POST /segment`
 
@@ -241,6 +250,146 @@ Response:
 
 Errors come as `{"error": "..."}` with status 400 (bad request) or 500
 (model/weights failures — the message tells you what to fix).
+
+### `POST /segment_many`
+
+Muchos prompts sobre **una** imagen en un solo pedido. El backbone de visión
+corre una vez (o ninguna, si la imagen ya está en la caché de features), y
+los prompts de sólo texto pasan por el detector en tandas de
+`AUTOSELECT_PROMPT_BATCH` (si se queda sin VRAM, la tanda se parte a la
+mitad y queda así hasta que el modelo se descarga). Los prompts con `box` o
+`points` corren de a uno sobre las mismas features; los que no tienen texto
+usan el tracker.
+
+```json
+{
+  "image_b64": "<png|jpeg base64>",
+  "prompts": [
+    "texto suelto",
+    {"text": "glove", "box": [x, y, w, h], "points": [[x, y]],
+     "point_labels": [1], "threshold": 0.3, "combine": "union",
+     "within": [x, y, w, h]}
+  ],
+  "masks": "instances",
+  "mask_threshold": 0.5
+}
+```
+
+- Hasta 256 prompts. Cada uno tiene que traer al menos uno de `text`, `box`,
+  `points` o `within`; un string suelto equivale a `{"text": ...}`.
+- `box` **con** `text` es un *exemplar*, no un filtro: SAM devuelve todas
+  las instancias parecidas de la imagen (la caja de un puño trae los dos
+  puños). `box` **sin** `text` usa el tracker y devuelve ese objeto.
+- `within` sí filtra: se quedan las instancias cuya caja cae al menos 50 %
+  adentro. Con una caja muy justa puede dar 0 resultados.
+- `masks`: `instances` (default) manda un PNG por instancia, recortado a su
+  caja, con el desplazamiento en `mask_xy`; `union` manda un PNG del tamaño
+  del canvas por prompt, respetando su `combine`; `none` manda sólo
+  `count`, `score` y `box`.
+- **Convención de cajas** (se mantiene por compatibilidad): las de
+  **entrada** (`box`, `within`) son `[x, y, ancho, alto]`; las de
+  **salida** (`instances[].box`) son `[x1, y1, x2, y2]`.
+
+Respuesta:
+
+```json
+{
+  "status": "ok", "width": 1581, "height": 1385,
+  "results": [{
+    "text": "glove", "count": 2,
+    "instances": [{"index": 0, "score": 0.96, "box": [x1, y1, x2, y2],
+                   "mask_xy": [x, y], "mask_b64": "<PNG L recortado>"}],
+    "mask_b64": "<sólo con masks=union: canvas entero>"
+  }],
+  "timing": {"prompts": 41, "vision_s": 0.59, "vision_cached": false,
+             "detector_s": 0.76, "batch": 16, "single_s": 1.41,
+             "total_s": 7.2}
+}
+```
+
+`results` viene en el mismo orden que `prompts`. Los errores de validación
+nombran el prompt: `400 {"error": "prompts[3]: box must be [x, y, width,
+height]"}`.
+
+Números de referencia (RTX de 24 GB, bf16, `santa.png` de 1581×1385, 41
+prompts: `person` + 20 partes × {text+within, text+box}): 7,2 s de servidor
+en frío (incluye cargar el modelo con los pesos ya en la caché de disco del
+SO) y 1,8 s en caliente, con las features cacheadas.
+
+## Cómo lo usan kri y autopainter
+
+El daemon es un servicio SAM puro: no sabe de personajes, partes ni flats.
+
+- **AI Select** (este plugin) arranca o reusa el daemon y lo usa con
+  `/segment`. Otros plugins de Krita llegan al mismo daemon con
+  `kritaautoselect.get_manager()` (`config.url`, `start()`); el nombre
+  viejo `_get_manager` queda como alias.
+- **kri** (`kri select sam`) usa `/segment` para convertir un prompt en una
+  selección de Krita. Antes de usar `/segment_many` mira `GET /health`: si
+  no aparece `segment_many` en `capabilities`, avisa que el daemon es viejo
+  en vez de fallar con un 404.
+- **autopainter** manda en un solo `/segment_many` todas las partes que
+  propone el VLM, como `text+box`, y se queda en el cliente con las
+  instancias cuya caja cae dentro de la caja del VLM (expandida). Si no
+  queda ninguna, cae a la caja sola (tracker). El motor de flats vive en
+  autopainter; acá no hay `/flats`.
+
+Para apuntar kri o autopainter a un daemon que no está en el puerto por
+defecto, se usa `AUTOSELECT_URL` (por ejemplo `http://127.0.0.1:5697`).
+
+## Instalador del ecosistema (contrato de componente)
+
+El instalador de autopainter (`installer/install.py`) no sabe cómo se
+instala AI Select: se lo pregunta a este repo.
+
+```bash
+python scripts/build_plugin.py --plan-json                       # plan de instalación
+python scripts/build_plugin.py --plan-json --platform windows    # plan para otro SO
+python scripts/build_plugin.py --plan-json --uninstall           # plan de desinstalación
+python scripts/build_plugin.py --uninstall [PYKRITA_DIR]         # sacar el plugin de pykrita
+```
+
+`--plan-json` no cambia nada. Imprime:
+
+```json
+{"component": "krita-autoselect", "version": "0.2.0", "uninstall": false,
+ "actions": [{"kind": "copy", "op": "install", "src": "...", "dst": "...",
+              "detail": {"sha256": "..."}}, ...],
+ "notes": [{"kind": "weights", "ok": false, "dst": "...", "argv": [...]}]}
+```
+
+Las acciones, en orden:
+
+| `kind` | `op: install` | `op: remove` |
+|---|---|---|
+| `copy` | cada archivo del plugin a pykrita (con `daemon/`); `detail.sha256` para saltear lo que ya está igual | borra cada archivo y, al final, la carpeta `kritaautoselect/` (`detail.tree`) |
+| `kritarc` | `[python] enable_kritaautoselect=true` | saca esa clave y deja todo lo demás |
+| `venv` | `<data>/.venv`; `detail.python` es el argv del Python del sistema que sirve (o `null`), `detail.prefer_uv` y `detail.uv_python` | borra el venv; `detail.keep` lista lo que **no** se toca (los pesos en `<data>/models/sam3`) |
+| `pip` | torch (índice CUDA 12.8, 12.6 para GPUs pre-Volta, CPU o PyPI en macOS) y después `-r requirements.txt` | — |
+| `write` | el marcador `.autoselect-installed`, que el plugin usa para dar la instalación por completa; antes hay que correr `detail.verify_code` con `detail.verify_python` | borra el marcador |
+
+`notes` trae lo que se verifica pero no se instala: los pesos de SAM 3
+(gated). Si faltan, `argv` es el comando de `download_weights.py` que los
+baja (necesita `HF_TOKEN`).
+
+Rutas: pykrita en `~/.local/share/krita/pykrita` (`XDG_DATA_HOME`),
+`%APPDATA%\krita\pykrita` o `~/Library/Application Support/krita/pykrita`;
+kritarc en `~/.config/kritarc` (`XDG_CONFIG_HOME`), `%LOCALAPPDATA%\kritarc`
+o `~/Library/Preferences/kritarc`; datos en
+`backend.default_data_dir()`. En Windows el home sale de `USERPROFILE` antes
+que de `HOME`, igual que en el plugin. En un Mac Intel el plan falla con
+`{"error": ...}` y código 2, porque no hay PyTorch nuevo para x86_64.
+
+Desde Python, `build_plugin.install_component(plan_only, uninstall, env)`
+devuelve la misma lista. `env` puede fijar `platform`, `environ`, `pykrita`,
+`kritarc`, `data_dir`, `system_python`, `gpu`, `mac_cpu` y `weights`; lo que
+falte se detecta en esta máquina (o queda vacío si el plan es para otro SO).
+Con `plan_only=False` ejecuta lo que puede hacer solo (copias, kritarc y,
+al desinstalar, los borrados); el venv, pip y el marcador (que va después de
+verificar) quedan para el instalador, que maneja uv y los logs.
+
+Ojo con kritarc: Krita lo reescribe al cerrarse, así que conviene tocarlo
+con Krita cerrado.
 
 ## Tests
 

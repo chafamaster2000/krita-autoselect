@@ -183,13 +183,19 @@ def _get_hub():
     return _hub
 
 
-def _get_manager():
+def get_manager():
+    """The plugin's DaemonManager (created on first use). Public: other
+    plugins (kritamcp) reach the daemon through it — config.url, start()."""
     global _manager
     if _manager is None:
         hub = _get_hub()
         _manager = DaemonManager(_config_from_settings())
         _manager.add_listener(hub.state.emit)
     return _manager
+
+
+# Old name, kept for plugins that still call it (kritamcp before ext-system).
+_get_manager = get_manager
 
 
 def _get_runner():
