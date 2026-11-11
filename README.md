@@ -13,6 +13,10 @@ kri select sam "the red car"          Krita canvas → daemon → Krita selectio
 curl -X POST :5679/segment -d ...     any image → mask
 ```
 
+Current version: **0.2.0** (plugin `__version__`, the build zip name and the
+`v0.2.0` tag agree); see [CHANGELOG.md](CHANGELOG.md). It is one of three
+pieces — see [Ecosistema](#ecosistema-kri-y-autopainter).
+
 ## Krita plugin: AI Select (standalone)
 
 `krita-plugin/kritaautoselect` is a Krita docker that needs nothing else: no
@@ -311,12 +315,20 @@ Respuesta:
 nombran el prompt: `400 {"error": "prompts[3]: box must be [x, y, width,
 height]"}`.
 
-Números de referencia (RTX de 24 GB, bf16, `santa.png` de 1581×1385, 41
+Números de referencia (RTX de 24 GB, bf16, una ilustración de 1581×1385, 41
 prompts: `person` + 20 partes × {text+within, text+box}): 7,2 s de servidor
 en frío (incluye cargar el modelo con los pesos ya en la caché de disco del
 SO) y 1,8 s en caliente, con las features cacheadas.
 
-## Cómo lo usan kri y autopainter
+## Ecosistema: kri y autopainter
+
+Este repo es una de tres piezas que se usan juntas, pero cada una anda sola:
+
+| Repo | Papel |
+|---|---|
+| **krita-autoselect** (este) | daemon SAM 3 (`/segment`, `/segment_many`) y el plugin AI Select de Krita, que lo instala, lo arranca y lo supervisa |
+| [krita-ai-cli](https://github.com/chafamaster2000/krita-ai-cli) | `kri`: CLI + plugin `kritamcp` que maneja Krita y AI Diffusion desde la terminal o un agente. `kri select sam` usa este daemon; tiene sistema de extensiones y server MCP |
+| autopainter (repo privado) | extensión de kri (`kri autopainter …`) que hace flats por partes de un lineart con un VLM y SAM 3, y que trae el instalador de las tres piezas. Usa `/segment_many` |
 
 El daemon es un servicio SAM puro: no sabe de personajes, partes ni flats.
 
@@ -339,8 +351,8 @@ defecto, se usa `AUTOSELECT_URL` (por ejemplo `http://127.0.0.1:5697`).
 
 ## Instalador del ecosistema (contrato de componente)
 
-El instalador de autopainter (`installer/install.py`) no sabe cómo se
-instala AI Select: se lo pregunta a este repo.
+El instalador del ecosistema (vive en autopainter, que es privado) no sabe
+cómo se instala AI Select: se lo pregunta a este repo con este contrato.
 
 ```bash
 python scripts/build_plugin.py --plan-json                       # plan de instalación
