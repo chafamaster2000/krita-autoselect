@@ -358,6 +358,7 @@ cómo se instala AI Select: se lo pregunta a este repo con este contrato.
 python scripts/build_plugin.py --plan-json                       # plan de instalación
 python scripts/build_plugin.py --plan-json --platform windows    # plan para otro SO
 python scripts/build_plugin.py --plan-json --uninstall           # plan de desinstalación
+python scripts/build_plugin.py --plan-json --skip-heavy          # sólo el plugin (sin torch ni daemon)
 python scripts/build_plugin.py --uninstall [PYKRITA_DIR]         # sacar el plugin de pykrita
 ```
 
@@ -390,11 +391,19 @@ kritarc en `~/.config/kritarc` (`XDG_CONFIG_HOME`), `%LOCALAPPDATA%\kritarc`
 o `~/Library/Preferences/kritarc`; datos en
 `backend.default_data_dir()`. En Windows el home sale de `USERPROFILE` antes
 que de `HOME`, igual que en el plugin. En un Mac Intel el plan falla con
-`{"error": ...}` y código 2, porque no hay PyTorch nuevo para x86_64.
+`{"error": ...}` y código 2, porque no hay PyTorch nuevo para x86_64; el
+mensaje sugiere `--skip-heavy`.
+
+Con `--skip-heavy` (`env["skip_heavy"]` desde Python) el plan trae sólo el
+plugin: las copias y `kritarc`, sin `venv`, `pip` ni el marcador. En un Mac
+Intel es la única forma de planear, y `notes` trae un aviso
+(`{"kind": "mac_intel", "ok": false}`) en lugar de los pesos: SAM 3 no corre
+ahí, y AI Select sólo sirve con un daemon en otra máquina.
 
 Desde Python, `build_plugin.install_component(plan_only, uninstall, env)`
 devuelve la misma lista. `env` puede fijar `platform`, `environ`, `pykrita`,
-`kritarc`, `data_dir`, `system_python`, `gpu`, `mac_cpu` y `weights`; lo que
+`kritarc`, `data_dir`, `system_python`, `gpu`, `mac_cpu`, `weights` y
+`skip_heavy`; lo que
 falte se detecta en esta máquina (o queda vacío si el plan es para otro SO).
 Con `plan_only=False` ejecuta lo que puede hacer solo (copias, kritarc y,
 al desinstalar, los borrados); el venv, pip y el marcador (que va después de

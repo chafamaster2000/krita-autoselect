@@ -4,6 +4,7 @@ import io
 import json
 import os
 import py_compile
+import shutil
 import sys
 import tempfile
 import unittest
@@ -153,9 +154,70 @@ class ComponentPlanTest(unittest.TestCase):
         self.assertEqual(torch["detail"]["args"], ["torch", "torchvision"])
 
     def test_mac_intel_is_refused(self):
-        with self.assertRaises(build_plugin._backend().PlanError):
+        with self.assertRaises(build_plugin._backend().PlanError) as cm:
             self.plan(platform="macos", environ={"HOME": "/Users/a"},
                       mac_cpu="x86_64")
+        self.assertIn("--skip-heavy", str(cm.exception))
+
+    def test_mac_intel_skip_heavy_plans_only_the_plugin(self):
+        env = dict(platform="macos", environ={"HOME": "/Users/a"},
+                   mac_cpu="x86_64", skip_heavy=True)
+        actions = self.plan(**env)
+        self.assertEqual({a["kind"] for a in actions}, {"copy", "kritarc"})
+        self.assertIn("/Users/a/Library/Application Support/krita/pykrita/"
+                      "kritaautoselect.desktop", {a["dst"] for a in actions})
+        notes = build_plugin.plan_notes(env)
+        self.assertEqual([n["kind"] for n in notes], ["mac_intel"])
+        self.assertFalse(notes[0]["ok"])
+        self.assertIn("SAM", notes[0]["detail"])
+        self.assertIn("Intel", notes[0]["detail"])
+
+    def test_skip_heavy_elsewhere_drops_torch_and_daemon(self):
+        actions = self.plan(platform="linux", environ={"HOME": "/h"},
+                            skip_heavy=True)
+        self.assertEqual({a["kind"] for a in actions}, {"copy", "kritarc"})
+        # en Apple Silicon igual, y los pesos siguen en las notas
+        env = dict(platform="macos", environ={"HOME": "/Users/a"},
+                   mac_cpu="arm64", skip_heavy=True)
+        self.assertEqual({a["kind"] for a in self.plan(**env)},
+                         {"copy", "kritarc"})
+        self.assertEqual(build_plugin.plan_notes(env)[0]["kind"], "weights")
+
+    def test_mac_intel_skip_heavy_executes_plugin_copy(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        pykrita = os.path.join(tmp, "pykrita")
+        kritarc = os.path.join(tmp, "kritarc")
+        build_plugin.install_component(plan_only=False, env=dict(
+            platform="macos", environ={"HOME": tmp}, mac_cpu="x86_64",
+            skip_heavy=True, pykrita=pykrita, kritarc=kritarc,
+            data_dir=os.path.join(tmp, "data"), system_python=None, gpu=None))
+        self.assertTrue(os.path.isfile(os.path.join(
+            pykrita, "kritaautoselect.desktop")))
+        with open(kritarc) as f:
+            self.assertIn("enable_kritaautoselect=true", f.read())
+        self.assertFalse(os.path.exists(os.path.join(tmp, "data")))
+
+    def test_cli_mac_intel(self):
+        intel = dict(build_plugin._detect({}, "linux", build_plugin._backend()),
+                     mac_cpu="x86_64")
+        orig = build_plugin._detect
+        build_plugin._detect = lambda *a: intel
+        self.addCleanup(setattr, build_plugin, "_detect", orig)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = build_plugin.main(["--plan-json", "--platform", "macos"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--skip-heavy", json.loads(buf.getvalue())["error"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = build_plugin.main(["--plan-json", "--platform", "macos",
+                                    "--skip-heavy"])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual({a["kind"] for a in out["actions"]},
+                         {"copy", "kritarc"})
+        self.assertEqual(out["notes"][0]["kind"], "mac_intel")
 
     def test_pre_volta_gpu_gets_cu126(self):
         actions = self.plan(platform="linux", environ={"HOME": "/h"},

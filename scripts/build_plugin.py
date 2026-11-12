@@ -206,21 +206,39 @@ def _detect(env, plat, bk):
     return out
 
 
+INTEL_SKIP_HINT = (
+    " Para instalar sólo el plugin (sin torch ni el daemon; AI Select queda "
+    "sin SAM, o usando un daemon de otra máquina), usá --skip-heavy.")
+INTEL_SKIPPED_NOTE = (
+    "Mac Intel: se instala sólo el plugin, sin torch ni el daemon. SAM 3 no "
+    "corre en esta máquina (PyTorch dejó de publicar versiones para Mac "
+    "Intel después de la 2.2); AI Select sólo anda con un daemon en otra "
+    "máquina (túnel SSH a su puerto).")
+
+
+def _mac_intel(plat, found, bk):
+    return plat == "macos" and found["mac_cpu"] == bk.MAC_INTEL
+
+
 def install_component(plan_only=True, uninstall=False, env=None):
     """Contract of §8: the actions that install (or uninstall) AI Select.
 
     env (all optional): {"platform": "linux|windows|macos",
     "environ": {...}, "pykrita": dir, "kritarc": file, "data_dir": dir,
     "system_python": [argv] | None, "gpu": {"name", "compute_cap"} | None,
-    "mac_cpu": "arm64|rosetta|x86_64", "weights": dir}. What is missing is
-    resolved for this machine (or left as a placeholder for another OS).
+    "mac_cpu": "arm64|rosetta|x86_64", "weights": dir, "skip_heavy": bool}.
+    What is missing is resolved for this machine (or left as a placeholder
+    for another OS). skip_heavy plans only the plugin (copies and kritarc):
+    no venv, torch, daemon dependencies or install marker.
 
     Action = {"kind": copy|write|kritarc|venv|pip, "op": install|remove,
     "src", "dst", "detail": {...}}. With plan_only=False the actions are
     also executed here (only what this script can do by itself: copy,
     kritarc and, on uninstall, the removals; venv, pip and the marker
-    write, which goes after verifying, are left to the installer). Raises bk.PlanError when the
-    machine cannot run the backend (Mac Intel).
+    write, which goes after verifying, are left to the installer). Raises
+    bk.PlanError when the machine cannot run the backend (Mac Intel) and
+    skip_heavy is not set; with skip_heavy the plugin is planned anyway and
+    plan_notes() warns that SAM does not run there.
     """
     env = dict(env or {})
     bk = _backend()
@@ -254,13 +272,18 @@ def install_component(plan_only=True, uninstall=False, env=None):
         return actions
 
     found = _detect(env, plat, bk)
-    if plat == "macos" and found["mac_cpu"] == bk.MAC_INTEL:
-        raise bk.PlanError(bk.MAC_INTEL_PROBLEM)
+    skip_heavy = bool(env.get("skip_heavy"))
+    if _mac_intel(plat, found, bk) and not skip_heavy:
+        raise bk.PlanError(bk.MAC_INTEL_PROBLEM + INTEL_SKIP_HINT)
 
     actions = [_action("copy", src, dst_of(arc), sha256=_sha256(src))
                for arc, src in plugin_files()]
     actions.append(_action("kritarc", None, kritarc, section=KRITARC_SECTION,
                            key=KRITARC_KEY, value="true"))
+    if skip_heavy:
+        if not plan_only:
+            _execute(actions)
+        return actions
     actions.append(_action("venv", None, venv_dir,
                            python=found["system_python"],
                            python_problem=found["python_problem"] or None,
@@ -300,6 +323,11 @@ def plan_notes(env=None):
     weights = bk.resolve_weights(setting, data_dir, plat)
     target = setting or bk.default_weights_dir(data_dir, plat)
     notes = []
+    if env.get("skip_heavy") and plat == "macos" and _mac_intel(
+            plat, _detect(env, plat, bk), bk):
+        # sin venv no hay con qué bajar ni usar los pesos
+        return [{"kind": "mac_intel", "ok": False,
+                 "detail": INTEL_SKIPPED_NOTE}]
     if not weights or not bk.weights_complete(weights):
         notes.append({
             "kind": "weights", "ok": False, "dst": target,
@@ -401,9 +429,15 @@ def main(argv=None):
                         "weights are kept)")
     p.add_argument("--platform", choices=("linux", "windows", "macos"),
                    help="with --plan-json: plan for another OS")
+    p.add_argument("--skip-heavy", action="store_true",
+                   help="with --plan-json: plan only the plugin (no venv, "
+                        "torch or daemon); on an Intel Mac this is the only "
+                        "plan there is")
     args = p.parse_args(argv)
     if args.plan_json:
         env = {"platform": args.platform} if args.platform else {}
+        if args.skip_heavy:
+            env["skip_heavy"] = True
         if args.uninstall and args.uninstall != default_pykrita():
             env["pykrita"] = args.uninstall
         if args.install and args.install != default_pykrita():
