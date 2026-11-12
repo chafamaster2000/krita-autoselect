@@ -7,6 +7,18 @@ de instalación (`build_plugin.py --plan-json`) y el tag anotado `vX.Y.Z`.
 La API HTTP del daemon tiene su propio número (`api_version` en
 `GET /health`).
 
+## [Unreleased]
+
+### Arreglado
+
+- **Mac Intel ya no corta la instalación con `--skip-heavy`.**
+  `scripts/build_plugin.py --plan-json --skip-heavy` (o
+  `env["skip_heavy"]` en `install_component`) planea sólo el plugin (copias y
+  `kritarc`, sin venv, torch, dependencias del daemon ni marcador) en
+  cualquier plataforma. En un Mac Intel, en vez de negarse, avisa en `notes`
+  (`kind: "mac_intel"`) que SAM 3 no corre ahí. Sin `--skip-heavy` el plan en
+  Mac Intel sigue fallando, pero el mensaje sugiere `--skip-heavy`.
+
 ## [0.2.0] - 2026-11-11
 
 Primera versión con tag. Junta las ramas `standalone-plugin`, `os-*`
